@@ -171,6 +171,6 @@ export LESS="--mouse"
 alias hallo="echo HALLO WELT"
 
 if [[ -z "$TMUX" ]]; then
-    bash ~/Scripts/tmux-init
+    #bash ~/Scripts/tmux-init
     tmux attach-session
 fi
