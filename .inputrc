@@ -1,0 +1,12 @@
+
+# Show completions immediately
+set show-all-if-ambiguous on
+
+# Menu completion
+#TAB: menu-complete
+#"\e[Z": menu-complete-backward   # Shift-Tab
+
+# Enable colors
+set colored-stats on
+set colored-completion-prefix on
+#set completion-display-width 0
