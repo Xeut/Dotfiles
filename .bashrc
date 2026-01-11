@@ -174,3 +174,5 @@ if [[ -z "$TMUX" ]]; then
     #bash ~/Scripts/tmux-init
     tmux attach-session
 fi
+
+# test 
