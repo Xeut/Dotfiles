@@ -74,7 +74,7 @@ bind -x '"\C-r": __fzf_history__'
 # Navigation & Files
 mkcd() { mkdir -p "$1" && cd "$1"; }
 cl() { cd "$1" && ls; }
-unalias countthis 2>/dev/null  # Add this line to clear any existing alias
+#unalias countthis 2>/dev/null  # Add this line to clear any existing alias
 countthis() { find . -path "./.venv" -prune -o -type f -exec wc -lw {} +; }
 
 # Network
