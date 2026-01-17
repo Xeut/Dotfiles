@@ -1,35 +1,68 @@
-# If not running interactively, don't do anything (leave this at the top of this file)
+# 1. PRE-FLIGHT CHECKS & SOURCING
+# If not running interactively, don't do anything
 [[ $- != *i* ]] && return
 
-# All the default Omarchy aliases and functions
-# (don't mess with these directly, just overwrite them here!)
+# Source default Omarchy configuration
 source ~/.local/share/omarchy/default/bash/rc
 
-# Add your own exports, aliases, and functions here.
-#
-export PATH="$HOME/Scripts:$PATH"
-export PATH="$HOME/.local/bin:$PATH"
+# 2. ENVIRONMENT VARIABLES (Exports)
+export EDITOR='nvim'
+export VISUAL='nvim'
+export BAT_PAGER="less -R"
+export LESS="--mouse"
+export HISTSIZE=100000
+export HISTFILESIZE=200000
 
-# Make an alias for invoking commands you use constantly
+# Path updates
+export PATH="$HOME/Scripts:$HOME/.local/bin:$PATH"
+
+# 3. SHELL OPTIONS & COMPLETION
+shopt -s histappend      # Append to history instead of overwriting
+shopt -s cdspell         # Autocorrect minor cd mistakes
+shopt -s globstar        # Recursive globbing (**)
+set -o noclobber         # Don't overwrite files accidentally
+
+# Case-insensitive and colored completions
+bind 'set completion-ignore-case on'
+bind 'set completion-map-case on'
+bind 'set colored-stats on'
+bind 'set colored-completion-prefix on'
+
+# Keybindings
+bind '"\e[1;3C": forward-word'    # Alt+Right
+bind '"\e[1;3D": backward-word'   # Alt+Left
+bind '"\C-l": clear-screen'       # Ctrl+L
+
+# 4. HISTORY CONFIGURATION
+# Avoid useless entries
+export HISTCONTROL=ignoreboth:erasedups
+export HISTIGNORE="ls:cd:pwd:exit"
+# Save/Sync history after every command
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }history -a; history -n"
+
+# 5. ALIASES
+# Development & Editors
 alias p='python'
-alias f='nvim $(ff)'
 alias vim='nvim'
-alias fp='fzf --preview "bat --style=numbers --color=always --line-range :500 {}"'
-alias bat='bat --style=numbers --color=always --paging=always'
-alias please='sudo $(history -p !!)'
+alias f='nvim $(ff)'
 alias bashrc='nvim ~/.bashrc && source ~/.bashrc'
-alias showmem='ps -eo pid,ppid,cmd,%mem --sort=-%mem | head -n 10'
-alias showcpu='ps -eo pid,ppid,cmd,%cpu --sort=-%cpu | head -n 10'
-alias weather='curl -s wttr.in?0'
-alias countthis='find . -path "./.venv" -prune -o -type f -exec wc -lw {} +'
-
-# Accessible at http://localhost:8000
 alias pyserve='python3 -m http.server'
 
-# Usage: psg firefox
+# System Tools
+alias bat='bat --style=numbers --color=always --paging=always'
+alias fp='fzf --preview "bat --style=numbers --color=always --line-range :500 {}"'
+alias please='sudo $(history -p !!)'
+alias showmem='ps -eo pid,ppid,cmd,%mem --sort=-%mem | head -n 10'
+alias showcpu='ps -eo pid,ppid,cmd,%cpu --sort=-%cpu | head -n 10'
 alias psg='ps aux | grep -v grep | grep -i -E'
+alias port='lsof -i :'
 
-# fuzzy finder for history 
+# Misc
+alias weather='curl -s wttr.in?0'
+alias hallo="echo HALLO WELT"
+
+# 6. FUNCTIONS
+# Fuzzy finder for history
 __fzf_history__() {
   local selected
   selected=$(history | fzf --tac +s | sed 's/ *[0-9]* *//')
@@ -38,78 +71,67 @@ __fzf_history__() {
 }
 bind -x '"\C-r": __fzf_history__'
 
-# mkdir + cd 
-mkcd() {
-  mkdir -p "$1" && cd "$1"
+# Navigation & Files
+mkcd() { mkdir -p "$1" && cd "$1"; }
+cl() { cd "$1" && ls; }
+unalias countthis 2>/dev/null  # Add this line to clear any existing alias
+countthis() { find . -path "./.venv" -prune -o -type f -exec wc -lw {} +; }
+
+# Network
+myip() {
+  echo "Local IP: $(hostname -I | awk '{print $1}')"
+  echo "Public IP: $(curl -s https://ifconfig.me)"
 }
 
-port() {
-  lsof -i :"$1"
-}
+# Utilities
+timer() { sleep "$1" && echo -e "\aTimer Finished: $(date)"; }
 
-cl() {
-  cd "$1" && ls
-}
-
-# Usage: timer 60 (for 60 seconds)
-timer() {
-  sleep "$1" && echo -e "\aTimer Finished: $(date)"
-}
-
-# Enhanced Quick Notes with Command Capture & Pipe Support
-qnote() {
-  local timestamp=$(date +"%Y-%m-%d : %H:%M:%S")
-  local note_file=~/.quicknotes.txt
-  
-  if [ -t 0 ]; then
-    # Case 1: Direct input (e.g., qnote "Hello")
-    if [ -n "$1" ]; then
-      echo -e "DATE: $timestamp\nNOTE: $*\n\n\e[31m$(printf '%.0s-' {1..40})\e[0m\n" >> "$note_file"
-    else
-      echo "Usage: qnote 'your message' OR your_command | qnote"
-    fi
-  else
-    # Case 2: Piped input (e.g., ip a | qnote)
-    # We grab the last command from history
-    local last_cmd=$(history 1 | sed 's/^[ ]*[0-9]*[ ]*//')
-    
-    {
-      echo "DATE:    $timestamp"
-      echo "COMMAND: $last_cmd"
-      echo -e "OUTPUT:\n"
-      cat # This captures the entire piped output as one block
-      echo -e "\n\e[31m$(printf '%.0s-' {1..40})\e[0m\n"
-    } >> "$note_file"
-  fi
-}
-
-# View Notes with 'bat'
-# Usage: vnote (shows all) or vnote 20 (shows last 20 lines)
-alias vnote='bat ~/.quicknotes.txt --style="full" --paging="always" -l log'
-
-# extract everything
+# Extraction logic
 extract() {
-  if [ -f $1 ] ; then
-    case $1 in
-      *.tar.bz2)   tar xjf $1     ;;
-      *.tar.gz)    tar xzf $1     ;;
-      *.bz2)       bunzip2 $1     ;;
-      *.rar)       unrar e $1     ;;
-      *.gz)        gunzip $1      ;;
-      *.tar)       tar xf $1      ;;
-      *.tbz2)      tar xjf $1     ;;
-      *.tgz)       tar xzf $1     ;;
-      *.zip)       unzip $1       ;;
-      *.Z)         uncompress $1  ;;
-      *.7z)        7z x $1        ;;
-      *)     echo "'$1' cannot be extracted via extract()" ;;
+  if [ -f "$1" ] ; then
+    case "$1" in
+      *.tar.bz2)   tar xjf "$1"     ;;
+      *.tar.gz)    tar xzf "$1"     ;;
+      *.bz2)       bunzip2 "$1"     ;;
+      *.rar)       unrar e "$1"     ;;
+      *.gz)        gunzip "$1"      ;;
+      *.tar)       tar xf "$1"      ;;
+      *.tbz2)      tar xjf "$1"     ;;
+      *.tgz)       tar xzf "$1"     ;;
+      *.zip)       unzip "$1"       ;;
+      *.Z)         uncompress "$1"  ;;
+      *.7z)        7z x "$1"        ;;
+      *)           echo "'$1' cannot be extracted via extract()" ;;
     esac
   else
     echo "'$1' is not a valid file"
   fi
 }
 
-# Enable programmable completion
+# Quick Notes
+qnote() {
+  local timestamp=$(date +"%Y-%m-%d : %H:%M:%S")
+  local note_file=~/.quicknotes.txt
+  if [ -t 0 ]; then
+    if [ -n "$1" ]; then
+      echo -e "DATE: $timestamp\nNOTE: $*\n\n\e[31m$(printf '%.0s-' {1..40})\e[0m\n" >> "$note_file"
+    else
+      echo "Usage: qnote 'your message' OR your_command | qnote"
+    fi
+  else
+    local last_cmd=$(history 1 | sed 's/^[ ]*[0-9]*[ ]*//')
+    {
+      echo "DATE:    $timestamp"
+      echo "COMMAND: $last_cmd"
+      echo -e "OUTPUT:\n"
+      cat
+      echo -e "\n\e[31m$(printf '%.0s-' {1..40})\e[0m\n"
+    } >> "$note_file"
+  fi
+}
+alias vnote='bat ~/.quicknotes.txt --style="full" --paging="always" -l log'
+
+# Programmable completion
 if ! shopt -oq posix; then
   if [ -f /usr/local/etc/bash_completion ]; then
     . /usr/local/etc/bash_completion
@@ -118,61 +140,10 @@ if ! shopt -oq posix; then
   fi
 fi
 
-# shows my local and public ip
-myip() {
-  echo "Local IP: $(hostname -I | awk '{print $1}')"
-  echo "Public IP: $(curl -s https://ifconfig.me)"
-}
-
-# Case-insensitive completion
-bind 'set completion-ignore-case on'
-
-# Hyphen/underscore equivalence
-bind 'set completion-map-case on'
-
-# Colorized completions
-bind 'set colored-stats on'
-bind 'set colored-completion-prefix on'
-
-# Big, shared history
-export HISTSIZE=100000
-export HISTFILESIZE=200000
-shopt -s histappend
-
-# Avoid useless entries
-export HISTCONTROL=ignoreboth:erasedups
-export HISTIGNORE="ls:cd:pwd:exit"
-
-# Save after every command
-PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }history -a; history -n"
-
-# Autocorrect minor cd mistakes
-shopt -s cdspell
-
-# Recursive globbing (**)
-shopt -s globstar
-
-# Don't overwrite files accidentally
-set -o noclobber
-
-# Alt+← / Alt+→ move by word
-bind '"\e[1;3C": forward-word'
-bind '"\e[1;3D": backward-word'
-
-# Ctrl+L clears screen cleanly
-bind '"\C-l": clear-screen'
-
-# My exports
-export EDITOR='nvim'
-export VISUAL='nvim'
-export BAT_PAGER="less -R"
-export LESS="--mouse"
-
-alias hallo="echo HALLO WELT"
-
+# 7. AUTO-START TMUX
+# Only run if we are NOT already in a tmux session
 if [[ -z "$TMUX" ]]; then
-    #bash ~/Scripts/tmux-init
-    tmux attach-session
+    # This creates a brand new session every time you open a terminal.
+    # Ghostty will now spawn a fresh tmux session (e.g., session 0, then 1, then 2).
+    exec tmux new-session
 fi
-
-# test 
