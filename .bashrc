@@ -147,3 +147,6 @@ if [[ -z "$TMUX" ]]; then
     # Ghostty will now spawn a fresh tmux session (e.g., session 0, then 1, then 2).
     exec tmux new-session
 fi
+
+# git-lookup shell integration
+eval "$(git-lookup shell-hook)"
