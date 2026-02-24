@@ -151,3 +151,6 @@ fi
 #test 
 # git-lookup shell integration
 eval "$(git-lookup shell-hook)"
+
+# Added by tt installer
+export PATH="$HOME/bin:$PATH"
