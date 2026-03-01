@@ -152,5 +152,7 @@ fi
 # git-lookup shell integration
 eval "$(git-lookup shell-hook)"
 
+# HALL WELT
+
 # Added by tt installer
 export PATH="$HOME/bin:$PATH"
