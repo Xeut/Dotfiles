@@ -148,11 +148,5 @@ if [[ -z "$TMUX" ]]; then
     exec tmux new-session
 fi
 
-#test 
-# git-lookup shell integration
-eval "$(git-lookup shell-hook)"
-
-# HALL WELT
-
 # Added by tt installer
 export PATH="$HOME/bin:$PATH"
