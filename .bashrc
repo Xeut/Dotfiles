@@ -83,6 +83,79 @@ myip() {
   echo "Public IP: $(curl -s https://ifconfig.me)"
 }
 
+sssh() {
+  # ── arguments ────────────────────────────────────────────────────
+  local host=$1
+  local bins=(fzf bat rg delta jq eza zoxide)   # ← only list to maintain
+  local configs=(~/.aliases ~/.bashrc_extra)     # ← optional: carry configs
+
+  [ -z "$host" ] && { echo "Usage: sssh user@host"; return 1; }
+
+  # ── copy binaries ─────────────────────────────────────────────────
+  local copied=()
+  local pids=()
+  local bin bin_path
+
+  echo "📦 Copying tools to $host in parallel..."
+  for bin in "${bins[@]}"; do
+    bin_path=$(which "$bin" 2>/dev/null) || { echo "  - $bin (not found locally)"; continue; }
+    scp -q "$bin_path" "$host:/tmp/$bin" 2>/dev/null &
+    pids+=($!)
+    copied+=("/tmp/$bin")
+  done
+
+  # ── copy configs ──────────────────────────────────────────────────
+  local cfg expanded cfg_copies=()
+  for cfg in "${configs[@]}"; do
+    expanded="${cfg/#\~/$HOME}"
+    [ -f "$expanded" ] || continue
+    scp -q "$expanded" "$host:/tmp/$(basename $expanded)" 2>/dev/null &
+    pids+=($!)
+    cfg_copies+=("/tmp/$(basename $expanded)")
+  done
+
+  # ── wait + verify ─────────────────────────────────────────────────
+  local failed=0
+  for i in "${!pids[@]}"; do
+    wait "${pids[$i]}" || { echo "  ✗ copy failed (pid ${pids[$i]})"; failed=1; }
+  done
+  [ $failed -eq 1 ] && echo "⚠️  Some copies failed — continuing anyway..."
+  echo "✓ Done — connecting..."
+
+  # ── build cleanup ─────────────────────────────────────────────────
+  local all_copied=("${copied[@]}" "${cfg_copies[@]}" "/tmp/.sssh_atjob")
+  local cleanup="rm -f ${all_copied[*]}"
+
+  # ── schedule fallback cleanup after 24h ───────────────────────────
+  ssh "$host" bash <<REMOTE
+    if command -v at &>/dev/null && command -v atd &>/dev/null 2>&1 || pgrep atd &>/dev/null; then
+      ATJOB=\$(echo '$cleanup' | at now + 24 hours 2>&1 | awk '/job/{print \$2}')
+      [ -n "\$ATJOB" ] && echo "\$ATJOB" > /tmp/.sssh_atjob
+    else
+      ( sleep 86400 && $cleanup ) </dev/null >/dev/null 2>&1 &
+      disown
+    fi
+REMOTE
+
+  # ── source block for remote session ──────────────────────────────
+  local source_block=""
+  for cfg in "${cfg_copies[@]}"; do
+    source_block+="[ -f $cfg ] && source $cfg"$'\n'
+  done
+
+  # ── connect ───────────────────────────────────────────────────────
+  ssh -t "$host" "
+    trap '
+      $cleanup
+      [ -f /tmp/.sssh_atjob ] && atrm \$(cat /tmp/.sssh_atjob) 2>/dev/null
+    ' EXIT
+
+    export PATH=/tmp:\$PATH
+    $source_block
+    bash
+  "
+}
+
 # Utilities
 timer() { sleep "$1" && echo -e "\aTimer Finished: $(date)"; }
 
