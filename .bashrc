@@ -84,76 +84,182 @@ myip() {
 }
 
 sssh() {
-  local host=$1
-  local bins=(bash curl wget less ps netstat tcpdump nmap htop vim fzf bat fd rg)
-  local pids=()
-  local copied=()
+  # ── config — only edit these two sections ────────────────────────
 
+  # STATIC  = single binary, no deps, always safe to copy (Go/Rust tools)
+  # DYNAMIC = has deps, copy and verify — removed if broken on remote
+  # SKIP    = never copy — use remote's own version (ABI/glibc sensitive)
+  local -A bin_type=(
+    [bash]="SKIP"
+    [curl]="DYNAMIC"    [wget]="DYNAMIC"    [less]="DYNAMIC"
+    [ps]="DYNAMIC"      [netstat]="DYNAMIC" [tcpdump]="DYNAMIC"
+    [nmap]="DYNAMIC"    [htop]="DYNAMIC"    [vim]="DYNAMIC"
+    [fzf]="STATIC"      [bat]="STATIC"      [fd]="STATIC"
+    [rg]="STATIC"
+  )
+
+  local bins=(bash curl wget less ps netstat tcpdump nmap htop vim fzf bat fd rg)
+
+  # ─────────────────────────────────────────────────────────────────
+
+  local host=$1
   [ -z "$host" ] && { echo "Usage: sssh user@host"; return 1; }
 
-  # ── extract only aliases from .bashrc into a temp file ───────────
-  local tmp_aliases=$(mktemp)
-  grep -E '^\s*(alias |function )' ~/.bashrc > "$tmp_aliases"
+  # ── detect remote shell ───────────────────────────────────────────
+  local remote_shell
+  remote_shell=$(ssh "$host" 'command -v bash || command -v sh' 2>/dev/null)
+  [ -z "$remote_shell" ] && { echo "✗ Could not detect remote shell"; return 1; }
+  echo "🐚 Remote shell: $remote_shell"
 
-  # also grab any function bodies (multi-line)
-  # this extracts complete function blocks
-  awk '
-    /^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\)/ { in_func=1; brace=0 }
-    in_func { print }
-    in_func && /{/ { brace++ }
-    in_func && /}/ { brace--; if (brace==0) in_func=0 }
-  ' ~/.bashrc >> "$tmp_aliases"
+  # ── check what remote already has (1 SSH call) ───────────────────
+  local check_script="for bin in ${bins[*]}; do command -v \"\$bin\" &>/dev/null && echo \"HAS \$bin\" || echo \"MISSING \$bin\"; done"
+  local remote_status
+  remote_status=$(ssh "$host" "$check_script" 2>/dev/null)
 
-  echo "📦 Copying tools to $host in parallel..."
+  # ── decide what to copy ───────────────────────────────────────────
+  local to_copy=() to_copy_paths=() to_copy_types=()
 
-  # ── copy binaries ─────────────────────────────────────────────────
-  local bin bin_path
-  for bin in "${bins[@]}"; do
-    bin_path=$(which "$bin" 2>/dev/null) || { echo "  - $bin (not found locally)"; continue; }
-    scp -q "$bin_path" "$host:/tmp/$bin" 2>/dev/null &
-    pids+=($!)
-    copied+=("/tmp/$bin")
-  done
+  echo ""
+  echo "📋 Planning..."
+  while IFS= read -r line; do
+    local bin="${line#* }"
+    local type="${bin_type[$bin]:-STATIC}"
+    local remote_has=false
+    [[ "$line" == HAS* ]] && remote_has=true
 
-  # ── copy extracted aliases ────────────────────────────────────────
-  scp -q "$tmp_aliases" "$host:/tmp/.sssh_aliases" 2>/dev/null &
-  pids+=($!)
-  copied+=("/tmp/.sssh_aliases")
-  rm -f "$tmp_aliases"
-
-  # ── wait + verify ─────────────────────────────────────────────────
-  local failed=0
-  for i in "${!pids[@]}"; do
-    wait "${pids[$i]}" || { echo "  ✗ copy failed (pid ${pids[$i]})"; failed=1; }
-  done
-  [ $failed -eq 1 ] && echo "⚠️  Some copies failed — continuing anyway..."
-  echo "✓ Done — connecting..."
-
-  # ── build cleanup ─────────────────────────────────────────────────
-  local all_copied=("${copied[@]}" "/tmp/.sssh_atjob")
-  local cleanup="rm -f ${all_copied[*]}"
-
-  # ── schedule fallback cleanup after 24h ───────────────────────────
-  ssh "$host" bash <<REMOTE
-    if command -v at &>/dev/null && pgrep atd &>/dev/null; then
-      ATJOB=\$(echo '$cleanup' | at now + 24 hours 2>&1 | awk '/job/{print \$2}')
-      [ -n "\$ATJOB" ] && echo "\$ATJOB" > /tmp/.sssh_atjob
-    else
-      ( sleep 86400 && $cleanup ) </dev/null >/dev/null 2>&1 &
-      disown
+    if [[ "$type" == "SKIP" ]]; then
+      echo "  ⊘  $bin — skipped (use remote's own)"
+      continue
     fi
-REMOTE
 
-  # ── connect ───────────────────────────────────────────────────────
+    if $remote_has; then
+      echo "  ✓  $bin — already on remote"
+      continue
+    fi
+
+    local local_path
+    local_path=$(which "$bin" 2>/dev/null)
+    if [ -z "$local_path" ]; then
+      echo "  -  $bin — not found locally"
+      continue
+    fi
+
+    echo "  →  $bin [$type] will be copied"
+    to_copy+=("$bin")
+    to_copy_paths+=("$local_path")
+    to_copy_types+=("$type")
+  done <<< "$remote_status"
+
+  # ── build env file: aliases + functions + cleanup setup ──────────
+  # alias      → live shell state, captures everything active right now
+  # declare -f → exact function bodies, no parsing needed
+  # Both are directly sourceable — no escaping, no regex, no .bashrc parsing
+  local tmp_env
+  tmp_env=$(mktemp /tmp/sssh_env.XXXXXX)
+
+  # aliases — exactly what's active in current shell
+  alias >> "$tmp_env"
+  echo "" >> "$tmp_env"
+
+  # user-defined functions only (subtract clean-bash baseline)
+  local clean_funcs current_funcs user_funcs
+  clean_funcs=$(bash --norc --noprofile -c 'declare -F' 2>/dev/null | awk '{print $3}')
+  current_funcs=$(declare -F | awk '{print $3}')
+  user_funcs=$(comm -23 <(echo "$current_funcs" | sort) <(echo "$clean_funcs" | sort))
+  [ -n "$user_funcs" ] && declare -f $user_funcs >> "$tmp_env"
+  echo "" >> "$tmp_env"
+
+  # build cleanup list from bins that will be copied + env file itself
+  local clean_list=("/tmp/.sssh_env" "/tmp/.sssh_atjob")
+  for bin in "${to_copy[@]}"; do clean_list+=("/tmp/$bin"); done
+  local cleanup="rm -f ${clean_list[*]}"
+
+  # append at-job scheduling directly into env file —
+  # runs once when sourced, avoids a separate SSH call and heredoc stdin issues
+  cat >> "$tmp_env" << SETUP
+
+# ── sssh: schedule fallback cleanup after 24h ──
+if command -v at &>/dev/null && pgrep atd &>/dev/null 2>&1; then
+  _SSSH_ATJOB=\$(echo '$cleanup' | at now + 24 hours 2>&1 | awk '/job/{print \$2}')
+  [ -n "\$_SSSH_ATJOB" ] && echo "\$_SSSH_ATJOB" > /tmp/.sssh_atjob
+else
+  ( sleep 86400 && $cleanup ) </dev/null >/dev/null 2>&1 &
+  disown
+fi
+unset _SSSH_ATJOB
+SETUP
+
+  local alias_count func_count
+  alias_count=$(grep -c '^alias' "$tmp_env" 2>/dev/null || echo 0)
+  func_count=$(echo "$user_funcs" | grep -c '.' 2>/dev/null || echo 0)
+  echo "  →  env snapshot: $alias_count aliases, $func_count functions"
+
+  # ── pre-clean remote /tmp to avoid overwrite errors ───────────────
+  ssh "$host" "rm -f ${clean_list[*]}" 2>/dev/null
+
+  # ── copy everything in parallel ───────────────────────────────────
+  local pids=() copied=() labels=()
+  echo ""
+  echo "📦 Copying to $host..."
+
+  for i in "${!to_copy[@]}"; do
+    scp -q "${to_copy_paths[$i]}" "$host:/tmp/${to_copy[$i]}" 2>/dev/null &
+    pids+=($!); copied+=("/tmp/${to_copy[$i]}"); labels+=("${to_copy[$i]}")
+  done
+
+  # env file — scp runs in background, no heredoc anywhere = no stdin theft
+  scp -q "$tmp_env" "$host:/tmp/.sssh_env" 2>/dev/null &
+  pids+=($!); copied+=("/tmp/.sssh_env"); labels+=(".sssh_env")
+  rm -f "$tmp_env"
+
+  # ── wait + report ─────────────────────────────────────────────────
+  local actual_copied=()
+  for i in "${!pids[@]}"; do
+    if wait "${pids[$i]}"; then
+      echo "  ✓  ${labels[$i]}"
+      actual_copied+=("${copied[$i]}")
+    else
+      echo "  ✗  ${labels[$i]} (copy failed)"
+    fi
+  done
+
+  # ── verify DYNAMIC binaries on remote, remove if broken ──────────
+  local verify_script=""
+  for i in "${!to_copy[@]}"; do
+    [[ "${to_copy_types[$i]}" != "DYNAMIC" ]] && continue
+    local bin="${to_copy[$i]}"
+    verify_script+="
+      if /tmp/$bin --version >/dev/null 2>&1 || /tmp/$bin -h >/dev/null 2>&1; then
+        echo \"OK $bin\"
+      else
+        echo \"BROKEN $bin\"
+        rm -f /tmp/$bin
+      fi"
+  done
+
+  if [ -n "$verify_script" ]; then
+    echo ""
+    echo "🔍 Verifying dynamic binaries on remote..."
+    while IFS= read -r result; do
+      local bin="${result#* }"
+      if [[ "$result" == OK* ]]; then
+        echo "  ✓  $bin works on remote"
+      else
+        echo "  ✗  $bin broken on remote (removed — deps missing)"
+        actual_copied=("${actual_copied[@]/\/tmp\/$bin}")
+      fi
+    done < <(ssh "$host" "bash -c '$verify_script'" 2>/dev/null)
+  fi
+
+  echo ""
+  echo "✓ Connecting..."
+
+  # ── connect with trap for clean exit cleanup ──────────────────────
   ssh -t "$host" "
-    trap '
-      $cleanup
-      [ -f /tmp/.sssh_atjob ] && atrm \$(cat /tmp/.sssh_atjob) 2>/dev/null
-    ' EXIT
-
+    trap '$cleanup; [ -f /tmp/.sssh_atjob ] && atrm \$(cat /tmp/.sssh_atjob) 2>/dev/null' EXIT
     export PATH=/tmp:\$PATH
-    [ -f /tmp/.sssh_aliases ] && source /tmp/.sssh_aliases
-    bash
+    [ -f /tmp/.sssh_env ] && source /tmp/.sssh_env
+    exec $remote_shell
   "
 }
 
