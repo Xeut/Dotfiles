@@ -207,10 +207,12 @@ SETUP
     pids+=($!); copied+=("/tmp/${to_copy[$i]}"); labels+=("${to_copy[$i]}")
   done
 
-  # env file — scp runs in background, no heredoc anywhere = no stdin theft
+  # env file — track pid separately so we can rm AFTER scp finishes
+  # rm -f before wait = race condition: file deleted before scp reads it
+  local env_pid
   scp -q "$tmp_env" "$host:/tmp/.sssh_env" 2>/dev/null &
-  pids+=($!); copied+=("/tmp/.sssh_env"); labels+=(".sssh_env")
-  rm -f "$tmp_env"
+  env_pid=$!
+  pids+=($env_pid); copied+=("/tmp/.sssh_env"); labels+=(".sssh_env")
 
   # ── wait + report ─────────────────────────────────────────────────
   local actual_copied=()
@@ -222,6 +224,7 @@ SETUP
       echo "  ✗  ${labels[$i]} (copy failed)"
     fi
   done
+  rm -f "$tmp_env"  # safe now — all scps have finished reading it
 
   # ── verify DYNAMIC binaries on remote, remove if broken ──────────
   local verify_script=""
