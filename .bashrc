@@ -84,19 +84,30 @@ myip() {
 }
 
 sssh() {
-  # ── arguments ────────────────────────────────────────────────────
   local host=$1
-  local bins=(fzf bat rg delta jq eza zoxide)   # ← only list to maintain
-  local configs=(~/.aliases ~/.bashrc_extra)     # ← optional: carry configs
+  local bins=(bash curl wget less ps netstat tcpdump nmap htop vim fzf bat fd rg)
+  local pids=()
+  local copied=()
 
   [ -z "$host" ] && { echo "Usage: sssh user@host"; return 1; }
 
-  # ── copy binaries ─────────────────────────────────────────────────
-  local copied=()
-  local pids=()
-  local bin bin_path
+  # ── extract only aliases from .bashrc into a temp file ───────────
+  local tmp_aliases=$(mktemp)
+  grep -E '^\s*(alias |function )' ~/.bashrc > "$tmp_aliases"
+
+  # also grab any function bodies (multi-line)
+  # this extracts complete function blocks
+  awk '
+    /^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\)/ { in_func=1; brace=0 }
+    in_func { print }
+    in_func && /{/ { brace++ }
+    in_func && /}/ { brace--; if (brace==0) in_func=0 }
+  ' ~/.bashrc >> "$tmp_aliases"
 
   echo "📦 Copying tools to $host in parallel..."
+
+  # ── copy binaries ─────────────────────────────────────────────────
+  local bin bin_path
   for bin in "${bins[@]}"; do
     bin_path=$(which "$bin" 2>/dev/null) || { echo "  - $bin (not found locally)"; continue; }
     scp -q "$bin_path" "$host:/tmp/$bin" 2>/dev/null &
@@ -104,15 +115,11 @@ sssh() {
     copied+=("/tmp/$bin")
   done
 
-  # ── copy configs ──────────────────────────────────────────────────
-  local cfg expanded cfg_copies=()
-  for cfg in "${configs[@]}"; do
-    expanded="${cfg/#\~/$HOME}"
-    [ -f "$expanded" ] || continue
-    scp -q "$expanded" "$host:/tmp/$(basename $expanded)" 2>/dev/null &
-    pids+=($!)
-    cfg_copies+=("/tmp/$(basename $expanded)")
-  done
+  # ── copy extracted aliases ────────────────────────────────────────
+  scp -q "$tmp_aliases" "$host:/tmp/.sssh_aliases" 2>/dev/null &
+  pids+=($!)
+  copied+=("/tmp/.sssh_aliases")
+  rm -f "$tmp_aliases"
 
   # ── wait + verify ─────────────────────────────────────────────────
   local failed=0
@@ -123,12 +130,12 @@ sssh() {
   echo "✓ Done — connecting..."
 
   # ── build cleanup ─────────────────────────────────────────────────
-  local all_copied=("${copied[@]}" "${cfg_copies[@]}" "/tmp/.sssh_atjob")
+  local all_copied=("${copied[@]}" "/tmp/.sssh_atjob")
   local cleanup="rm -f ${all_copied[*]}"
 
   # ── schedule fallback cleanup after 24h ───────────────────────────
   ssh "$host" bash <<REMOTE
-    if command -v at &>/dev/null && command -v atd &>/dev/null 2>&1 || pgrep atd &>/dev/null; then
+    if command -v at &>/dev/null && pgrep atd &>/dev/null; then
       ATJOB=\$(echo '$cleanup' | at now + 24 hours 2>&1 | awk '/job/{print \$2}')
       [ -n "\$ATJOB" ] && echo "\$ATJOB" > /tmp/.sssh_atjob
     else
@@ -136,12 +143,6 @@ sssh() {
       disown
     fi
 REMOTE
-
-  # ── source block for remote session ──────────────────────────────
-  local source_block=""
-  for cfg in "${cfg_copies[@]}"; do
-    source_block+="[ -f $cfg ] && source $cfg"$'\n'
-  done
 
   # ── connect ───────────────────────────────────────────────────────
   ssh -t "$host" "
@@ -151,7 +152,7 @@ REMOTE
     ' EXIT
 
     export PATH=/tmp:\$PATH
-    $source_block
+    [ -f /tmp/.sssh_aliases ] && source /tmp/.sssh_aliases
     bash
   "
 }
