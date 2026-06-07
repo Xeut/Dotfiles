@@ -264,22 +264,11 @@ PROBE
     printf "alias vi='nvim'\n" >> "$_tmp_env"
   fi
 
-  # 5. cleanup list — built before appending to env so TRAPBLOCK can reference it
-  local _clean=("/tmp/.sssh_env" "/tmp/.sssh_pid")
+  # 5. cleanup list
+  local _clean=("/tmp/.sssh_env" "/tmp/.sssh_guardian")
   for _b in "${_to_copy[@]}"; do _clean+=("/tmp/$_b"); done
   $_copy_nvim && _clean+=("$_nvim_rdir")
   local _cleanup_cmd="rm -rf ${_clean[*]}"
-
-  # 6. trap (in rcfile so it's set in the final interactive shell, not lost via exec)
-  # BUG FIX: $$ must be a literal in the file so it expands on the REMOTE shell
-  # Use single-quoted heredoc for the $$ line; cleanup_cmd expands locally (correct)
-  cat >> "$_tmp_env" << 'TRAP_OPEN'
-
-# sssh: write remote PID and clean up on exit
-printf '%s\n' "$$" > /tmp/.sssh_pid
-TRAP_OPEN
-  # cleanup_cmd intentionally expands here (local variable → literal string in file)
-  printf 'trap %q EXIT\n' "$_cleanup_cmd" >> "$_tmp_env"
 
   # 7. remote env filter (runs on source — purges broken aliases/completions)
   cat >> "$_tmp_env" << 'ENV_FILTER'
@@ -538,33 +527,49 @@ LUA
     fi
   fi
 
-  # ── guardian: cleans up if session dies without triggering EXIT ───
-  # (SIGKILL, network drop, OOM) — fires after 2h max regardless
-  # written as a real script file — avoids quote-nesting where $_cleanup_cmd
-  # (local variable) would be trapped inside single quotes and never expand
-  # clean exit: trap fires → removes /tmp/.sssh_pid → guardian exits quietly
+  # ── guardian: remote fallback for network-drop case ──────────────
+  # ssh -t exits locally when session ends (clean exit, kill, pty close)
+  # and we run cleanup from local side immediately after
+  # guardian covers only the one case where local machine loses connectivity
+  # and the remote session is also killed — cleans up after 2h in that case
   printf '\n✓  Connecting...\n'
-
-  # write guardian script to remote then launch it detached
-  # printf handles the expansion correctly: $_cleanup_cmd expands locally (good),
-  # $(...) and $var inside the script body stay literal (good)
   ssh "${_cm_opts[@]}" "$_host" bash -s << GUARDIAN
 cat > /tmp/.sssh_guardian << 'SCRIPT'
 #!/bin/bash
+# launched before session; exits when session ends or after 2h
+# the local-side cleanup runs first in normal cases; this is the fallback
 _timeout=7200; _elapsed=0
-for _i in \$(seq 300); do [ -f /tmp/.sssh_pid ] && break; sleep 0.1; done
-_spid=\$(cat /tmp/.sssh_pid 2>/dev/null)
-[ -z "\$_spid" ] && { rm -f /tmp/.sssh_guardian; exit 0; }
-while kill -0 "\$_spid" 2>/dev/null && [ -f /tmp/.sssh_pid ]; do
-  sleep 5; _elapsed=\$((_elapsed+5)); [ \$_elapsed -ge \$_timeout ] && break
+# wait up to 30s for session to start (ssh -t takes a moment)
+for _i in \$(seq 300); do
+  ssh_procs=\$(pgrep -c sshd 2>/dev/null || echo 0)
+  [ "\$ssh_procs" -gt 0 ] && break
+  sleep 0.1
 done
-sleep 2
-[ -f /tmp/.sssh_pid ] && { $_cleanup_cmd; rm -f /tmp/.sssh_pid; }
-rm -f /tmp/.sssh_guardian
+# just sleep for the timeout — local cleanup handles normal cases
+sleep "\$_timeout"
+# if we reach here (2h passed) run cleanup regardless
+$_cleanup_cmd
 SCRIPT
 chmod +x /tmp/.sssh_guardian
 nohup /tmp/.sssh_guardian </dev/null >/dev/null 2>&1 &
 GUARDIAN
+
+  # ── _sssh_connect: session + guaranteed local cleanup ─────────────
+  # ssh -t blocks until session ends for ANY reason:
+  #   clean exit, kill -9, pty close, network drop (ssh detects TCP close)
+  # cleanup runs on local machine after ssh returns — always executes
+  _sssh_connect() {
+    local _cmd
+    [[ "$_rshell" == *bash ]] \
+      && _cmd="$_rshell --rcfile /tmp/.sssh_env" \
+      || _cmd="ENV=/tmp/.sssh_env $_rshell -i"
+
+    ssh -t "${_cm_opts[@]}" "$_host" "export PATH=/tmp:\$PATH; $_cmd"
+
+    # LOCAL cleanup — guaranteed to run when ssh -t exits
+    # works for: clean exit, kill, network drop (ssh returns with error)
+    ssh "${_cm_opts[@]}" "$_host" "$_cleanup_cmd" 2>/dev/null || true
+  }
 
   _sssh_connect
 }
