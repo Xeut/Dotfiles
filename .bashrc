@@ -126,16 +126,15 @@ sssh() {
   chmod 700 "$_cm_dir"
   local _cm_sock="$_cm_dir/ctrl"
   local _cm_opts=(-o ControlMaster=no -o ControlPath="$_cm_sock" -o ConnectTimeout=10)
-
-  # open master connection; clean up on function return regardless of path taken
   local _cm_pid=""
-  _sssh_close_cm() {
+
+  # called at every exit point — no trap needed (trap RETURN fires on every
+  # sub-function return inside sssh, causing "command not found" spam)
+  _sssh_cm_close() {
     [ -n "$_cm_pid" ] && kill "$_cm_pid" 2>/dev/null
     ssh -o ControlPath="$_cm_sock" -O exit "$_host" 2>/dev/null
     rm -rf "$_cm_dir"
-    unset -f _sssh_close_cm
   }
-  trap '_sssh_close_cm' RETURN
 
   printf '🔗 Connecting to %s...\n' "$_host"
   ssh -o ControlMaster=yes -o ControlPath="$_cm_sock" \
@@ -145,7 +144,7 @@ sssh() {
 
   local _i=0
   while (( _i++ < 50 )) && [[ ! -S "$_cm_sock" ]]; do sleep 0.1; done
-  [[ ! -S "$_cm_sock" ]] && { printf '✗ Could not connect to %s\n' "$_host"; return 1; }
+  [[ ! -S "$_cm_sock" ]] && { printf '✗ Could not connect to %s\n' "$_host"; _sssh_cm_close; return 1; }
 
   # ── single remote call: detect + check bins + cache check ─────────
   local _bin_list="${_bins[*]}"
@@ -171,7 +170,7 @@ PROBE
   # SEC: validate remote_shell — must be absolute path to a known shell
   # prevents a malicious server from injecting commands via shell path
   if [[ ! "$_rshell" =~ ^/[a-zA-Z0-9/_-]+$ ]] || [[ ! "$_rshell" =~ (ba)?sh$ ]]; then
-    printf '✗ Remote returned suspicious shell path: %q\n' "$_rshell"; return 1
+    printf '✗ Remote returned suspicious shell path: %q\n' "$_rshell"; _sssh_cm_close; return 1
   fi
 
   if printf '%s\n' "$_probe" | grep -q '^CACHED'; then
@@ -202,6 +201,7 @@ PROBE
     printf '⚡ Cache hit (%dm old) — connecting directly  (--force to re-copy)\n' \
       "$(( _cache_age / 60 ))"
     _sssh_connect
+    _sssh_cm_close
     return
   fi
 
@@ -572,6 +572,7 @@ GUARDIAN
   }
 
   _sssh_connect
+  _sssh_cm_close
 }
 
 # Utilities
