@@ -91,9 +91,10 @@ sssh() {
     [ps]="DYNAMIC"      [netstat]="DYNAMIC" [tcpdump]="DYNAMIC"
     [nmap]="DYNAMIC"    [htop]="DYNAMIC"    [vim]="DYNAMIC"
     [fzf]="STATIC"      [bat]="STATIC"      [fd]="STATIC"
-    [rg]="STATIC"
+    [rg]="STATIC"       [eza]="DYNAMIC"     [mise]="DYNAMIC"
   )
-  local bins=(bash curl wget less ps netstat tcpdump nmap htop vim fzf bat fd rg)
+  local bins=(bash curl wget less ps netstat tcpdump nmap htop vim fzf bat fd rg eza mise)
+  local max_bundled_deps=8  # bins with more deps than this: verify-only, no bundling
 
   local nvim_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/nvim"
   local nvim_plugins_dir="${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy"
@@ -139,24 +140,75 @@ sssh() {
   local remote_status
   remote_status=$(ssh "$host" "$check_script" 2>/dev/null)
 
+  # ── dep resolver: finds non-standard .so files needed by a binary ──
+  # "non-standard" = not in the baseline set every Linux distro ships
+  _sssh_get_deps() {
+    local bin_path="$1"
+    local always=(
+      "linux-vdso" "libm.so" "libc.so" "libdl.so" "libpthread.so"
+      "librt.so"   "libutil.so" "libgcc_s.so" "ld-linux" "ld-musl"
+    )
+    ldd "$bin_path" 2>/dev/null | while read -r line; do
+      local sopath; sopath=$(echo "$line" | awk '{print $3}')
+      [ ! -f "$sopath" ] && continue
+      local soname; soname=$(echo "$line" | awk '{print $1}')
+      local skip=false
+      for base in "${always[@]}"; do [[ "$soname" == ${base}* ]] && { skip=true; break; }; done
+      $skip && continue
+      echo "$sopath"
+    done | sort -u
+  }
+
   # ── plan binary copies ────────────────────────────────────────────
   local to_copy=() to_copy_paths=() to_copy_types=()
+  local to_bundle_deps=()   # parallel array: space-separated dep paths per bin
+  local all_dep_paths=()    # flat list of all unique .so files to copy
+
   echo ""
   echo "📋 Planning..."
   while IFS= read -r line; do
     local bin="${line#* }" type="${bin_type[$bin]:-STATIC}" remote_has=false
     [[ "$line" == HAS* ]] && remote_has=true
-    if   [[ "$type" == "SKIP" ]];  then echo "  ⊘  $bin — skipped (use remote's own)"
-    elif $remote_has;               then echo "  ✓  $bin — already on remote"
+    if   [[ "$type" == "SKIP" ]]; then echo "  ⊘  $bin — skipped (use remote's own)"
+    elif $remote_has;              then echo "  ✓  $bin — already on remote"
     else
       local local_path; local_path=$(which "$bin" 2>/dev/null)
-      if [ -z "$local_path" ]; then echo "  -  $bin — not found locally"
+      if [ -z "$local_path" ]; then
+        echo "  -  $bin — not found locally"
       else
-        echo "  →  $bin [$type] will be copied"
+        if [[ "$type" == "DYNAMIC" ]]; then
+          # resolve deps and decide: bundle or verify-only
+          local deps; deps=$(_sssh_get_deps "$local_path")
+          local dep_count; dep_count=$(echo "$deps" | grep -c . || echo 0)
+
+          if [ "$dep_count" -eq 0 ]; then
+            echo "  →  $bin [DYNAMIC/no-extra-deps] will be copied"
+            to_bundle_deps+=("")
+          elif [ "$dep_count" -le "$max_bundled_deps" ]; then
+            echo "  →  $bin [DYNAMIC/$dep_count deps] will be copied + libs bundled"
+            echo "$deps" | while read -r d; do echo "       lib: $(basename $d)"; done
+            # add to flat dep list (deduplicated)
+            while read -r d; do
+              [[ " ${all_dep_paths[*]} " != *" $d "* ]] && all_dep_paths+=("$d")
+            done <<< "$deps"
+            to_bundle_deps+=("$deps")
+          else
+            echo "  →  $bin [DYNAMIC/$dep_count deps — too many to bundle] copy + verify"
+            to_bundle_deps+=("TOO_MANY")
+          fi
+        else
+          echo "  →  $bin [STATIC] will be copied"
+          to_bundle_deps+=("")
+        fi
         to_copy+=("$bin"); to_copy_paths+=("$local_path"); to_copy_types+=("$type")
       fi
     fi
   done <<< "$remote_status"
+
+  # report bundled libs
+  if [ ${#all_dep_paths[@]} -gt 0 ]; then
+    echo "  →  ${#all_dep_paths[@]} shared libs will be bundled → /tmp/lib/"
+  fi
 
   # ── plan nvim ─────────────────────────────────────────────────────
   if $copy_nvim; then
@@ -211,8 +263,10 @@ NVIMALIAS
   fi
 
   # build cleanup list
-  local clean_list=("/tmp/.sssh_env" "/tmp/.sssh_atjob")
-  for bin in "${to_copy[@]}"; do clean_list+=("/tmp/$bin"); done
+  local clean_list=("/tmp/.sssh_env" "/tmp/.sssh_atjob" "/tmp/lib")
+  for bin in "${to_copy[@]}"; do
+    clean_list+=("/tmp/$bin" "/tmp/.${bin}.bin")  # wrapper + hidden real binary
+  done
   $copy_nvim && clean_list+=("$nvim_remote_home")
   local cleanup="rm -rf ${clean_list[*]}"
 
@@ -271,9 +325,27 @@ REMOTENVIM
   echo ""
   echo "📦 Copying binaries to $host..."
 
+  # copy shared libs first (if any bins need bundling)
+  if [ ${#all_dep_paths[@]} -gt 0 ]; then
+    ssh "$host" "mkdir -p /tmp/lib" 2>/dev/null
+    for dep in "${all_dep_paths[@]}"; do
+      scp -q "$dep" "$host:/tmp/lib/$(basename $dep)" 2>/dev/null &
+      pids+=($!); copied+=("/tmp/lib/$(basename $dep)"); labels+=("lib/$(basename $dep)")
+    done
+  fi
+
   for i in "${!to_copy[@]}"; do
-    scp -q "${to_copy_paths[$i]}" "$host:/tmp/${to_copy[$i]}" 2>/dev/null &
-    pids+=($!); copied+=("/tmp/${to_copy[$i]}"); labels+=("${to_copy[$i]}")
+    local bin="${to_copy[$i]}" deps="${to_bundle_deps[$i]:-}"
+
+    if [ -n "$deps" ] && [ "$deps" != "TOO_MANY" ]; then
+      # has bundled deps — copy as hidden .bin, wrapper goes on remote via ssh
+      scp -q "${to_copy_paths[$i]}" "$host:/tmp/.${bin}.bin" 2>/dev/null &
+      pids+=($!); copied+=("/tmp/.${bin}.bin"); labels+=("${bin} (binary)")
+    else
+      # static or too-many-deps — copy directly as /tmp/bin
+      scp -q "${to_copy_paths[$i]}" "$host:/tmp/${bin}" 2>/dev/null &
+      pids+=($!); copied+=("/tmp/${bin}"); labels+=("${bin}")
+    fi
   done
 
   # env file — track pid, rm only after wait (race condition fix)
@@ -292,6 +364,33 @@ REMOTENVIM
     fi
   done
   rm -f "$tmp_env"
+
+  # ── create wrapper scripts on remote for bins with bundled deps ───
+  local wrappers_needed=false
+  for i in "${!to_copy[@]}"; do
+    local bin="${to_copy[$i]}" deps="${to_bundle_deps[$i]:-}"
+    [ -z "$deps" ] || [ "$deps" = "TOO_MANY" ] && continue
+    wrappers_needed=true
+  done
+
+  if $wrappers_needed; then
+    echo ""
+    echo "🔧 Creating lib wrappers on remote..."
+    local wrapper_cmds=""
+    for i in "${!to_copy[@]}"; do
+      local bin="${to_copy[$i]}" deps="${to_bundle_deps[$i]:-}"
+      [ -z "$deps" ] || [ "$deps" = "TOO_MANY" ] && continue
+      # wrapper: sets LD_LIBRARY_PATH then execs the real hidden binary
+      wrapper_cmds+="
+        printf '#!/bin/sh\nexec env LD_LIBRARY_PATH=\"/tmp/lib:\${LD_LIBRARY_PATH}\" /tmp/.${bin}.bin \"\$@\"\n' > /tmp/${bin}
+        chmod +x /tmp/${bin}
+        echo 'WRAPPER_OK ${bin}'"
+    done
+    ssh "$host" "bash -c '$wrapper_cmds'" 2>/dev/null | while read -r line; do
+      bin="${line#* }"
+      [[ "$line" == WRAPPER_OK* ]] && echo "  ✓  $bin wrapper created"
+    done
+  fi
 
   # ── sync nvim config + plugins ────────────────────────────────────
   if $copy_nvim; then
