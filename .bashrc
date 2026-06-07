@@ -288,16 +288,27 @@ _sssh_filter_aliases() {
 
 # ── sssh: reset completions bound to functions that no longer exist ──
 _sssh_clean_completions() {
+  # pass 1: remove any completion bound to a function that no longer exists
   while IFS= read -r _line; do
     local _func _cmd
     _func=$(echo "$_line" | grep -oE '\-F \S+' | awk '{print $2}')
-    _cmd=$(echo "$_line" | awk '{print $NF}')
+    _cmd=$(echo "$_line"  | awk '{print $NF}')
     [ -z "$_func" ] && continue
     declare -f "$_func" &>/dev/null && continue
     complete -r "$_cmd" 2>/dev/null
   done < <(complete -p 2>/dev/null)
-  # always reset cd — zoxide, autojump, z.sh all hijack it
+
+  # pass 2: install safe replacements using only POSIX compgen flags
+  # (-d, -f, -c etc.) — avoids compgen -V which requires bash >= 5.3
   complete -r cd 2>/dev/null
+  complete -o filenames -o nospace -d cd   # cd → directories only, safe on any bash
+
+  # pass 3: remove completions for tools we copied to /tmp
+  # their system completion scripts may use compgen -V or other new features
+  for _cmd in fzf bat rg fd delta eza; do
+    command -v "$_cmd" &>/dev/null || continue
+    complete -r "$_cmd" 2>/dev/null
+  done
 }
 
 _sssh_purge_plugins
