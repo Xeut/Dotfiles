@@ -157,6 +157,12 @@ sssh() {
   local tmp_env
   tmp_env=$(mktemp /tmp/sssh_env.XXXXXX)
 
+  # source remote's own bashrc/profile first so our aliases override, not get overridden
+  cat >> "$tmp_env" << 'HEADER'
+[ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null
+[ -f ~/.profile ] && source ~/.profile 2>/dev/null
+HEADER
+
   # aliases — exactly what's active in current shell
   alias >> "$tmp_env"
   echo "" >> "$tmp_env"
@@ -257,12 +263,21 @@ SETUP
   echo ""
   echo "✓ Connecting..."
 
-  # ── connect with trap for clean exit cleanup ──────────────────────
+  # ── connect ───────────────────────────────────────────────────────
+  # aliases are NOT inherited across exec — source/exec in the same shell
+  # doesn't help either. Must use --rcfile so the NEW shell process loads
+  # them on startup. Fallback to ENV= for non-bash remote shells (POSIX sh).
+  local connect_cmd
+  if [[ "$remote_shell" == *bash ]]; then
+    connect_cmd="exec $remote_shell --rcfile /tmp/.sssh_env"
+  else
+    connect_cmd="ENV=/tmp/.sssh_env exec $remote_shell -i"
+  fi
+
   ssh -t "$host" "
     trap '$cleanup; [ -f /tmp/.sssh_atjob ] && atrm \$(cat /tmp/.sssh_atjob) 2>/dev/null' EXIT
     export PATH=/tmp:\$PATH
-    [ -f /tmp/.sssh_env ] && source /tmp/.sssh_env
-    exec $remote_shell
+    $connect_cmd
   "
 }
 
