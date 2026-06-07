@@ -84,421 +84,406 @@ myip() {
 }
 
 sssh() {
-  # ── config ────────────────────────────────────────────────────────
-  local -A bin_type=(
-    [bash]="SKIP"
-    [curl]="DYNAMIC"    [wget]="DYNAMIC"    [less]="DYNAMIC"
-    [ps]="DYNAMIC"      [netstat]="DYNAMIC" [tcpdump]="DYNAMIC"
-    [nmap]="DYNAMIC"    [htop]="DYNAMIC"    [vim]="DYNAMIC"
-    [fzf]="STATIC"      [bat]="STATIC"      [fd]="STATIC"
+  # ── config — only edit this block ────────────────────────────────
+  local -A _bin_type=(
+    [bash]="SKIP"                                        # never copy — glibc/ABI sensitive
+    [curl]="DYNAMIC"  [wget]="DYNAMIC"  [less]="DYNAMIC"  # copy + verify on remote
+    [ps]="DYNAMIC"    [netstat]="DYNAMIC" [tcpdump]="DYNAMIC"
+    [nmap]="DYNAMIC"  [htop]="DYNAMIC"  [vim]="DYNAMIC"
+    [fzf]="STATIC"    [bat]="STATIC"    [fd]="STATIC"    # static; musl fallback if broken
     [rg]="STATIC"
   )
-  local bins=(bash curl wget less ps netstat tcpdump nmap htop vim fzf bat fd rg)
-  local nvim_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/nvim"
-  local nvim_plugins_dir="${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy"
-  local nvim_remote_home="/tmp/nvim_home"
-  local cache_ttl=14400  # seconds — skip copy if env file is fresher than this (4h)
+  local _bins=(bash curl wget less ps netstat tcpdump nmap htop vim fzf bat fd rg)
+  local _nvim_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/nvim"
+  local _nvim_lazy="${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy"
+  local _nvim_rdir="/tmp/nvim_home"
+  local _cache_ttl=14400   # 4h — skip copy if remote env file is this fresh
   # ─────────────────────────────────────────────────────────────────
 
-  local host="" copy_nvim=false copy_plugins=false force=false
+  local _host="" _copy_nvim=false _copy_plugins=false _force=false
 
-  for arg in "$@"; do
-    case "$arg" in
+  for _arg in "$@"; do
+    case "$_arg" in
       --help|-h)
-        echo "Usage: sssh user@host [--nvim] [--nvim-full] [--force]"
-        echo "  --nvim       nvim binary (downloaded on remote) + config"
-        echo "  --nvim-full  + all plugins synced (~100-300MB)"
-        echo "  --force      re-copy even if remote cache is fresh"
+        printf 'Usage: sssh user@host [--nvim] [--nvim-full] [--force]\n'
+        printf '  --nvim       nvim binary (downloaded on remote) + config\n'
+        printf '  --nvim-full  + all plugins synced (~100-300MB)\n'
+        printf '  --force      re-copy even if remote cache is fresh\n'
         return 0 ;;
-      --nvim)      copy_nvim=true ;;
-      --nvim-full) copy_nvim=true; copy_plugins=true ;;
-      --force)     force=true ;;
-      -*)          echo "Unknown flag: $arg"; return 1 ;;
-      *)           host="$arg" ;;
+      --nvim)      _copy_nvim=true ;;
+      --nvim-full) _copy_nvim=true; _copy_plugins=true ;;
+      --force)     _force=true ;;
+      -*)          printf 'Unknown flag: %s\n' "$_arg"; return 1 ;;
+      *)           _host="$_arg" ;;
     esac
   done
-  [ -z "$host" ] && { sssh --help; return 1; }
+  [ -z "$_host" ] && { sssh --help; return 1; }
 
-  # ── ControlMaster — one persistent connection for ALL subsequent calls ──
-  # eliminates repeated TCP+SSH handshakes (~200ms each → ~5ms each)
-  local cm_socket="/tmp/sssh_cm_${host//[@:.]/_}"
-  local cm_opts=(-o ControlMaster=no -o ControlPath="$cm_socket" -o ConnectTimeout=10)
-  local cm_pid=""
+  # ── ControlMaster — reuse one TCP+SSH connection for all calls ────
+  # each subsequent ssh/scp costs ~5ms instead of ~200ms
+  # socket lives in a private dir (mode 700) to prevent pre-creation attacks
+  local _cm_dir; _cm_dir=$(mktemp -d /tmp/sssh.XXXXXX)
+  chmod 700 "$_cm_dir"
+  local _cm_sock="$_cm_dir/ctrl"
+  local _cm_opts=(-o ControlMaster=no -o ControlPath="$_cm_sock" -o ConnectTimeout=10)
 
-  _sssh_cleanup_cm() {
-    [ -n "$cm_pid" ] && kill "$cm_pid" 2>/dev/null
-    ssh -o ControlPath="$cm_socket" -O exit "$host" 2>/dev/null
-    rm -f "$cm_socket"
+  # open master connection; clean up on function return regardless of path taken
+  local _cm_pid=""
+  _sssh_close_cm() {
+    [ -n "$_cm_pid" ] && kill "$_cm_pid" 2>/dev/null
+    ssh -o ControlPath="$_cm_sock" -O exit "$_host" 2>/dev/null
+    rm -rf "$_cm_dir"
+    unset -f _sssh_close_cm
   }
-  trap '_sssh_cleanup_cm' RETURN
+  trap '_sssh_close_cm' RETURN
 
-  echo "🔗 Connecting to $host..."
-  ssh -o ControlMaster=yes \
-      -o ControlPath="$cm_socket" \
-      -o ControlPersist=120 \
-      -o ConnectTimeout=10 \
-      -N "$host" &
-  cm_pid=$!
+  printf '🔗 Connecting to %s...\n' "$_host"
+  ssh -o ControlMaster=yes -o ControlPath="$_cm_sock" \
+      -o ControlPersist=120 -o ConnectTimeout=10 \
+      -N "$_host" &
+  _cm_pid=$!
 
-  # wait for socket (max 5s)
-  local i=0
-  while [ $i -lt 50 ] && [ ! -S "$cm_socket" ]; do sleep 0.1; ((i++)); done
-  [ ! -S "$cm_socket" ] && { echo "✗ Could not connect to $host"; return 1; }
+  local _i=0
+  while (( _i++ < 50 )) && [[ ! -S "$_cm_sock" ]]; do sleep 0.1; done
+  [[ ! -S "$_cm_sock" ]] && { printf '✗ Could not connect to %s\n' "$_host"; return 1; }
 
-  # ── ONE SSH call: detect + check bins + cache check + pre-clean ───
-  local bin_list="${bins[*]}"
-  local setup_result
-  setup_result=$(ssh "${cm_opts[@]}" "$host" "bash -s" << SETUP
-# detect
-echo "SHELL=\$(command -v bash || command -v sh)"
-echo "ARCH=\$(uname -m)"
-echo "BASH_VER=\${BASH_VERSINFO[0]}.\${BASH_VERSINFO[1]}"
-
-# cache check — if env file is fresh and force not requested, skip copy
-if [ "$force" = false ] && [ -f /tmp/.sssh_env ]; then
-  age=\$(( \$(date +%s) - \$(stat -c %Y /tmp/.sssh_env 2>/dev/null || echo 0) ))
-  if [ "\$age" -lt "$cache_ttl" ]; then
-    echo "CACHED \$age"
-  fi
+  # ── single remote call: detect + check bins + cache check ─────────
+  local _bin_list="${_bins[*]}"
+  local _probe
+  _probe=$(ssh "${_cm_opts[@]}" "$_host" bash -s << PROBE
+printf 'SHELL=%s\n' "\$(command -v bash || command -v sh)"
+printf 'ARCH=%s\n'  "\$(uname -m)"
+if [ "$_force" = false ] && [ -f /tmp/.sssh_env ]; then
+  _age=\$(( \$(date +%s) - \$(stat -c %Y /tmp/.sssh_env 2>/dev/null || echo 0) ))
+  [ "\$_age" -lt "$_cache_ttl" ] && printf 'CACHED %s\n' "\$_age"
 fi
-
-# check which bins are present
-for bin in $bin_list; do
-  command -v "\$bin" &>/dev/null && echo "HAS \$bin" || echo "MISSING \$bin"
+for _b in $_bin_list; do
+  command -v "\$_b" >/dev/null 2>&1 && printf 'HAS %s\n' "\$_b" || printf 'MISSING %s\n' "\$_b"
 done
-
-# pre-clean stale sssh files (not cached case)
-echo "READY"
-SETUP
+PROBE
 )
 
-  # ── parse setup result ────────────────────────────────────────────
-  local remote_shell remote_arch remote_bash_ver cached=false cache_age=0
-  remote_shell=$(echo "$setup_result" | grep '^SHELL=' | cut -d= -f2)
-  remote_arch=$(echo  "$setup_result" | grep '^ARCH='  | cut -d= -f2)
-  remote_bash_ver=$(echo "$setup_result" | grep '^BASH_VER=' | cut -d= -f2)
-  [ -z "$remote_shell" ] && { echo "✗ Could not detect remote shell"; return 1; }
+  # ── parse probe output ────────────────────────────────────────────
+  local _rshell _rarch _cached=false _cache_age=0
+  _rshell=$(printf '%s\n' "$_probe" | awk -F= '/^SHELL=/{print $2}')
+  _rarch=$( printf '%s\n' "$_probe" | awk -F= '/^ARCH=/{print $2}')
 
-  if echo "$setup_result" | grep -q '^CACHED'; then
-    cache_age=$(echo "$setup_result" | grep '^CACHED' | awk '{print $2}')
-    cached=true
+  # SEC: validate remote_shell — must be absolute path to a known shell
+  # prevents a malicious server from injecting commands via shell path
+  if [[ ! "$_rshell" =~ ^/[a-zA-Z0-9/_-]+$ ]] || [[ ! "$_rshell" =~ (ba)?sh$ ]]; then
+    printf '✗ Remote returned suspicious shell path: %q\n' "$_rshell"; return 1
   fi
 
-  local local_arch; local_arch=$(uname -m)
-  local same_arch=false
-  [ "$local_arch" = "$remote_arch" ] && same_arch=true
+  if printf '%s\n' "$_probe" | grep -q '^CACHED'; then
+    _cache_age=$(printf '%s\n' "$_probe" | awk '/^CACHED/{print $2}')
+    _cached=true
+  fi
 
-  echo "🐚 Remote: $remote_shell (bash $remote_bash_ver) on $remote_arch"
-  $same_arch || echo "⚠ Arch mismatch ($local_arch → $remote_arch)"
+  local _larch; _larch=$(uname -m)
+  local _same_arch=false
+  [[ "$_larch" = "$_rarch" ]] && _same_arch=true
 
-  # ── cache hit: skip all copies, just connect ──────────────────────
-  if $cached; then
-    local mins=$(( cache_age / 60 ))
-    echo "⚡ Cache hit (${mins}m old) — skipping copy, connecting directly"
-    echo "   (use --force to re-copy)"
+  printf '🐚 Remote: %s on %s\n' "$_rshell" "$_rarch"
+  $_same_arch || printf '⚠  Arch mismatch (%s → %s) — .so files excluded\n' "$_larch" "$_rarch"
 
-    local connect_cmd
-    [[ "$remote_shell" == *bash ]] \
-      && connect_cmd="exec $remote_shell --rcfile /tmp/.sssh_env" \
-      || connect_cmd="ENV=/tmp/.sssh_env exec $remote_shell -i"
+  # ── helper: connect (used by cache-hit path and main path) ────────
+  # no exec — bash --rcfile starts as the interactive shell directly
+  # trap set inside rcfile survives because it's sourced into the final shell
+  _sssh_connect() {
+    local _cmd
+    [[ "$_rshell" == *bash ]] \
+      && _cmd="$_rshell --rcfile /tmp/.sssh_env" \
+      || _cmd="ENV=/tmp/.sssh_env $_rshell -i"
+    ssh -t "${_cm_opts[@]}" "$_host" "export PATH=/tmp:\$PATH; $_cmd"
+  }
 
-    ssh -t "${cm_opts[@]}" "$host" "
-      export PATH=/tmp:\$PATH
-      $connect_cmd
-    "
+  # ── cache hit: connect directly ───────────────────────────────────
+  if $_cached; then
+    printf '⚡ Cache hit (%dm old) — connecting directly  (--force to re-copy)\n' \
+      "$(( _cache_age / 60 ))"
+    _sssh_connect
     return
   fi
 
-  # ── plan what to copy ─────────────────────────────────────────────
-  local to_copy=() to_copy_paths=() to_copy_types=()
-  echo ""
-  echo "📋 Planning..."
+  # ── plan copies ───────────────────────────────────────────────────
+  local _to_copy=() _to_paths=() _to_types=()
+  printf '\n📋 Planning...\n'
 
-  while IFS= read -r line; do
-    local bin="${line#* }" type="${bin_type[$bin]:-STATIC}" remote_has=false
-    [[ "$line" == HAS* ]] && remote_has=true
-    if   [[ "$type" == "SKIP" ]]; then echo "  ⊘  $bin — use remote's own"
-    elif $remote_has;              then echo "  ✓  $bin — already present"
+  while IFS= read -r _line; do
+    local _b="${_line#* }" _t="${_bin_type[${_line#* }]:-STATIC}"
+    if   [[ "$_t" == SKIP ]];       then printf '  ⊘  %s — use remote own\n' "$_b"
+    elif [[ "$_line" == HAS* ]];    then printf '  ✓  %s — already present\n' "$_b"
     else
-      local lp; lp=$(which "$bin" 2>/dev/null)
-      if [ -z "$lp" ]; then echo "  -  $bin — not found locally"
+      local _lp; _lp=$(command -v "$_b" 2>/dev/null)
+      if [[ -z "$_lp" ]]; then printf '  -  %s — not found locally\n' "$_b"
       else
-        echo "  →  $bin [$type]"
-        to_copy+=("$bin"); to_copy_paths+=("$lp"); to_copy_types+=("$type")
+        printf '  →  %s [%s]\n' "$_b" "$_t"
+        _to_copy+=("$_b"); _to_paths+=("$_lp"); _to_types+=("$_t")
       fi
     fi
-  done <<< "$(echo "$setup_result" | grep -E '^(HAS|MISSING) ')"
+  done <<< "$(printf '%s\n' "$_probe" | grep -E '^(HAS|MISSING) ')"
 
   # ── plan nvim ─────────────────────────────────────────────────────
-  if $copy_nvim && [ ! -d "$nvim_config_dir" ]; then
-    echo "  ✗ ~/.config/nvim not found — disabling --nvim"; copy_nvim=false
+  if $_copy_nvim && [[ ! -d "$_nvim_cfg" ]]; then
+    printf '  ✗  ~/.config/nvim not found — disabling --nvim\n'; _copy_nvim=false
   fi
-  if $copy_nvim; then
-    echo "  →  nvim (download on remote) + config ($(du -sh "$nvim_config_dir" 2>/dev/null | cut -f1))"
-    if $copy_plugins && [ -d "$nvim_plugins_dir" ]; then
-      echo "  →  plugins ($(du -sh "$nvim_plugins_dir" 2>/dev/null | cut -f1))"
-    fi
+  if $_copy_nvim; then
+    printf '  →  nvim (download on remote) + config (%s)\n' \
+      "$(du -sh "$_nvim_cfg" 2>/dev/null | cut -f1)"
+    $_copy_plugins && [[ -d "$_nvim_lazy" ]] && \
+      printf '  →  plugins (%s)\n' "$(du -sh "$_nvim_lazy" 2>/dev/null | cut -f1)"
   fi
 
   # ── build env file ────────────────────────────────────────────────
-  local tmp_env; tmp_env=$(mktemp /tmp/sssh_env.XXXXXX)
+  local _tmp_env; _tmp_env=$(mktemp /tmp/sssh_env.XXXXXX)
 
-  cat >> "$tmp_env" << 'HEADER'
-[ -f ~/.bashrc ]  && source ~/.bashrc  2>/dev/null
-[ -f ~/.profile ] && source ~/.profile 2>/dev/null
-HEADER
+  # 1. source remote's own config first (our aliases override after)
+  printf '%s\n' \
+    '[ -f ~/.bashrc ]  && source ~/.bashrc  2>/dev/null' \
+    '[ -f ~/.profile ] && source ~/.profile 2>/dev/null' \
+    >> "$_tmp_env"
 
-  alias >> "$tmp_env"; echo "" >> "$tmp_env"
+  # 2. live aliases (exactly what's active now — no parsing needed)
+  alias >> "$_tmp_env"
+  printf '\n' >> "$_tmp_env"
 
-  local clean_funcs current_funcs user_funcs
-  clean_funcs=$(bash --norc --noprofile -c 'declare -F' 2>/dev/null | awk '{print $3}')
-  current_funcs=$(declare -F | awk '{print $3}')
-  user_funcs=$(comm -23 <(echo "$current_funcs" | sort) <(echo "$clean_funcs" | sort))
-  [ -n "$user_funcs" ] && declare -f $user_funcs >> "$tmp_env"
-  echo "" >> "$tmp_env"
+  # 3. user-defined functions (subtract clean-bash baseline)
+  local _clean_fns _cur_fns _user_fns
+  _clean_fns=$(bash --norc --noprofile -c 'declare -F' 2>/dev/null | awk '{print $3}')
+  _cur_fns=$(declare -F | awk '{print $3}')
+  _user_fns=$(comm -23 <(printf '%s\n' "$_cur_fns" | sort) \
+                        <(printf '%s\n' "$_clean_fns" | sort))
+  # shellcheck disable=SC2086
+  [[ -n "$_user_fns" ]] && declare -f $_user_fns >> "$_tmp_env"
+  printf '\n' >> "$_tmp_env"
 
-  if $copy_nvim; then
-    cat >> "$tmp_env" << NVIMALIAS
-alias nvim='XDG_CONFIG_HOME=$nvim_remote_home/.config XDG_DATA_HOME=$nvim_remote_home/.local/share XDG_STATE_HOME=$nvim_remote_home/.local/state XDG_CACHE_HOME=$nvim_remote_home/.cache $nvim_remote_home/bin/nvim'
-alias vi='nvim'
-NVIMALIAS
+  # 4. nvim alias (if copying nvim)
+  if $_copy_nvim; then
+    printf "alias nvim='XDG_CONFIG_HOME=%s/.config XDG_DATA_HOME=%s/.local/share XDG_STATE_HOME=%s/.local/state XDG_CACHE_HOME=%s/.cache %s/bin/nvim'\n" \
+      "$_nvim_rdir" "$_nvim_rdir" "$_nvim_rdir" "$_nvim_rdir" "$_nvim_rdir" >> "$_tmp_env"
+    printf "alias vi='nvim'\n" >> "$_tmp_env"
   fi
 
-  # alias + plugin + completion filter (runs on source on remote)
-  cat >> "$tmp_env" << 'ENV_FILTER'
+  # 5. cleanup list — built before appending to env so TRAPBLOCK can reference it
+  local _clean=("/tmp/.sssh_env" "/tmp/.sssh_pid")
+  for _b in "${_to_copy[@]}"; do _clean+=("/tmp/$_b"); done
+  $_copy_nvim && _clean+=("$_nvim_rdir")
+  local _cleanup_cmd="rm -rf ${_clean[*]}"
 
+  # 6. trap (in rcfile so it's set in the final interactive shell, not lost via exec)
+  # BUG FIX: $$ must be a literal in the file so it expands on the REMOTE shell
+  # Use single-quoted heredoc for the $$ line; cleanup_cmd expands locally (correct)
+  cat >> "$_tmp_env" << 'TRAP_OPEN'
+
+# sssh: write remote PID and clean up on exit
+printf '%s\n' "$$" > /tmp/.sssh_pid
+TRAP_OPEN
+  # cleanup_cmd intentionally expands here (local variable → literal string in file)
+  printf 'trap %q EXIT\n' "$_cleanup_cmd" >> "$_tmp_env"
+
+  # 7. remote env filter (runs on source — purges broken aliases/completions)
+  cat >> "$_tmp_env" << 'ENV_FILTER'
+
+# ── sssh: strip plugin functions that require tools not on this server ──
 _sssh_purge_plugins() {
-  local _patterns=(
-    '^_zoxide' '^__zoxide' '^zd$' '^_z$' '^__z$' '^_z_'
-    '^_fzf_' '^__fzf_' '^_fasd' '^fasd' '^_autojump' '^autojump'
-    '^_zellij' '^__zellij' '^_atuin' '^__atuin'
-  )
-  local _funcs _func _pat _removed=()
-  _funcs=$(declare -F | awk '{print $3}')
-  while IFS= read -r _func; do
-    for _pat in "${_patterns[@]}"; do
-      if echo "$_func" | grep -qE "$_pat"; then
-        unset -f "$_func" 2>/dev/null; _removed+=("$_func"); break
-      fi
+  local _p _f _removed=()
+  local _pats=('^_zoxide' '^__zoxide' '^zd$' '^_z$' '^__z$' '^_z_'
+               '^_fzf_' '^__fzf_' '^_fasd' '^fasd' '^_autojump' '^autojump'
+               '^_zellij' '^__zellij' '^_atuin' '^__atuin')
+  while IFS= read -r _f; do
+    for _p in "${_pats[@]}"; do
+      if [[ "$_f" =~ $_p ]]; then unset -f "$_f" 2>/dev/null; _removed+=("$_f"); break; fi
     done
-  done <<< "$_funcs"
-  [ ${#_removed[@]} -gt 0 ] && \
-    echo "sssh: removed ${#_removed[@]} plugin functions: ${_removed[*]}"
-  PROMPT_COMMAND=$(printf '%s' "$PROMPT_COMMAND" | \
-    tr ';' '\n' | grep -vE '_zoxide_hook|__zoxide|_z_hook|atuin|__bp_' | \
-    grep -v '^[[:space:]]*$' | paste -sd ';' -)
+  done < <(declare -F | awk '{print $3}')
+  (( ${#_removed[@]} )) && printf 'sssh: removed %d plugin functions: %s\n' \
+    "${#_removed[@]}" "${_removed[*]}"
+  # strip plugin hooks from PROMPT_COMMAND
+  PROMPT_COMMAND=$(printf '%s' "$PROMPT_COMMAND" | tr ';' '\n' \
+    | grep -vE '_zoxide_hook|__zoxide|_z_hook|atuin|__bp_' \
+    | grep -v '^[[:space:]]*$' | paste -sd ';' -)
 }
 
+# ── sssh: remove aliases whose commands aren't on this server ──────
 _sssh_filter_aliases() {
-  local _name _body _cmds _cmd _skipped=()
-  for _name in $(alias | sed "s/alias \([^=]*\)=.*/\1/"); do
-    _body=$(alias "$_name" 2>/dev/null | sed "s/alias $_name=//;s/^'//;s/'$//")
-    _cmds=$(echo "$_body" | \
-      sed 's/&&/\n/g; s/||/\n/g; s/|/\n/g; s/;/\n/g; s/\$(/\n/g' | \
-      awk '{print $1}' | grep -oE '[a-zA-Z_][a-zA-Z0-9_-]+' | sort -u)
-    local _missing=""
+  local _n _body _cmds _cmd _skipped=()
+  for _n in $(alias | sed "s/alias \([^=]*\)=.*/\1/"); do
+    _body=$(alias "$_n" 2>/dev/null | sed "s/alias $_n=//;s/^'//;s/'$//")
+    # extract all command-position tokens (start, after && || | ; $()
+    _cmds=$(printf '%s' "$_body" \
+      | sed 's/&&/\n/g;s/||/\n/g;s/|/\n/g;s/;/\n/g;s/\$(/\n/g' \
+      | awk '{print $1}' | grep -oE '[a-zA-Z_][a-zA-Z0-9_-]+' | sort -u)
+    local _miss=""
     while IFS= read -r _cmd; do
-      [ -z "$_cmd" ] && continue
+      [[ -z "$_cmd" ]] && continue
       case "$_cmd" in
         cd|echo|printf|source|export|local|return|true|false|test|if|then|else|\
         do|done|while|for|in|case|esac|fi|time|sudo|grep|awk|sed|sort|cut|\
         head|tail|xargs|find|tar|mkdir|rm|cp|mv|cat|wc|read|history|ps|\
-        unset|shift|set|trap|wait|exec|eval|type|command|hash|pwd|env)
-          continue ;;
+        unset|shift|set|trap|wait|exec|eval|type|command|hash|pwd|env) continue ;;
       esac
-      command -v "$_cmd" &>/dev/null && continue
-      _missing="$_cmd"; break
+      command -v "$_cmd" >/dev/null 2>&1 && continue
+      _miss="$_cmd"; break
     done <<< "$_cmds"
-    if [ -n "$_missing" ]; then
-      _skipped+=("$_name($_missing)"); unalias "$_name" 2>/dev/null
+    if [[ -n "$_miss" ]]; then
+      _skipped+=("${_n}(${_miss})"); unalias "$_n" 2>/dev/null
     fi
   done
-  if [ ${#_skipped[@]} -gt 0 ]; then
-    echo "sssh: skipped ${#_skipped[@]} aliases (not on this server):"
-    local _s; for _s in "${_skipped[@]}"; do echo "  ✗  $_s"; done
-  fi
+  (( ${#_skipped[@]} )) && {
+    printf 'sssh: skipped %d aliases (commands not on this server):\n' "${#_skipped[@]}"
+    printf '  ✗  %s\n' "${_skipped[@]}"
+  }
 }
 
+# ── sssh: reset completions that use missing functions ──────────────
 _sssh_clean_completions() {
+  local _func _cmd
   while IFS= read -r _line; do
-    local _func _cmd
-    _func=$(echo "$_line" | grep -oE '\-F \S+' | awk '{print $2}')
-    _cmd=$(echo "$_line"  | awk '{print $NF}')
-    [ -z "$_func" ] && continue
-    declare -f "$_func" &>/dev/null && continue
+    _func=$(printf '%s' "$_line" | grep -oE '\-F \S+' | awk '{print $2}')
+    _cmd=$( printf '%s' "$_line" | awk '{print $NF}')
+    [[ -z "$_func" ]] && continue
+    declare -f "$_func" >/dev/null 2>&1 && continue
     complete -r "$_cmd" 2>/dev/null
   done < <(complete -p 2>/dev/null)
+  # always reset cd (zoxide/autojump hijack it) with a bash-version-safe spec
   complete -r cd 2>/dev/null
   complete -o filenames -o nospace -d cd
-  for _cmd in fzf bat rg fd delta eza; do
-    command -v "$_cmd" &>/dev/null || continue
-    complete -r "$_cmd" 2>/dev/null
+  # strip completions for copied tools — their system scripts may use bash 5.3+ features
+  local _t; for _t in fzf bat rg fd delta eza; do
+    command -v "$_t" >/dev/null 2>&1 && complete -r "$_t" 2>/dev/null
   done
 }
 
-_sssh_purge_plugins
-_sssh_filter_aliases
-_sssh_clean_completions
+_sssh_purge_plugins; _sssh_filter_aliases; _sssh_clean_completions
 unset -f _sssh_purge_plugins _sssh_filter_aliases _sssh_clean_completions
 ENV_FILTER
 
-  # build cleanup list
-  local clean_list=("/tmp/.sssh_env" "/tmp/.sssh_atjob")
-  for bin in "${to_copy[@]}"; do clean_list+=("/tmp/$bin"); done
-  $copy_nvim && clean_list+=("$nvim_remote_home")
-  local cleanup="rm -rf ${clean_list[*]}"
+  printf '  →  env: %d aliases, %d functions\n' \
+    "$(grep -c '^alias' "$_tmp_env" 2>/dev/null || true)" \
+    "$(printf '%s\n' "$_user_fns" | grep -c . 2>/dev/null || true)"
 
-  cat >> "$tmp_env" << SETUP
-
-if command -v at &>/dev/null && pgrep atd &>/dev/null 2>&1; then
-  _SSSH_ATJOB=\$(echo '$cleanup' | at now + 24 hours 2>&1 | awk '/job/{print \$2}')
-  [ -n "\$_SSSH_ATJOB" ] && echo "\$_SSSH_ATJOB" > /tmp/.sssh_atjob
-else
-  ( sleep 86400 && $cleanup ) </dev/null >/dev/null 2>&1 &
-  disown
-fi
-unset _SSSH_ATJOB
-SETUP
-
-  local alias_count func_count
-  alias_count=$(grep -c '^alias' "$tmp_env" 2>/dev/null || echo 0)
-  func_count=$(echo "$user_funcs" | grep -c '.' 2>/dev/null || echo 0)
-  echo "  →  env: $alias_count aliases, $func_count functions"
-
-  # ── pre-clean via ControlMaster (fast — reuses connection) ────────
-  ssh "${cm_opts[@]}" "$host" "rm -rf ${clean_list[*]}" 2>/dev/null
+  # ── pre-clean remote (via ControlMaster — fast) ───────────────────
+  ssh "${_cm_opts[@]}" "$_host" "rm -rf ${_clean[*]}" 2>/dev/null
 
   # ── start nvim download on remote in background ───────────────────
-  local nvim_dl_pid=""
-  if $copy_nvim; then
-    echo ""
-    echo "⬇  Downloading nvim on remote (background)..."
-    ssh "${cm_opts[@]}" "$host" "bash -s" << 'REMOTENVIM' > /tmp/sssh_nvim_dl.log 2>&1 &
-set -e
-NRH="/tmp/nvim_home"
+  local _nvim_dl_pid=""
+  if $_copy_nvim; then
+    printf '\n⬇  Downloading nvim on remote (background)...\n'
+    ssh "${_cm_opts[@]}" "$_host" bash -s > /tmp/sssh_nvim_dl.log 2>&1 << 'NVIM_DL' &
 case "$(uname -m)" in
-  x86_64)        NA="x86_64" ;; aarch64|arm64) NA="arm64" ;; *) NA="x86_64" ;;
+  x86_64) _na=x86_64 ;; aarch64|arm64) _na=arm64 ;; *) _na=x86_64 ;;
 esac
-NV=$(curl -sL "https://api.github.com/repos/neovim/neovim/releases/latest" \
+_nv=$(curl -sL "https://api.github.com/repos/neovim/neovim/releases/latest" \
   | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-[ -z "$NV" ] && NV="v0.10.4"
-mkdir -p "$NRH"
-curl -sL "https://github.com/neovim/neovim/releases/download/${NV}/nvim-linux-${NA}.tar.gz" \
-  | tar -xzf - -C "$NRH" --strip-components=1
-echo "NVIM_OK ${NV} linux-${NA}"
-REMOTENVIM
-    nvim_dl_pid=$!
+[ -z "$_nv" ] && _nv="v0.10.4"
+mkdir -p /tmp/nvim_home
+curl -sL "https://github.com/neovim/neovim/releases/download/${_nv}/nvim-linux-${_na}.tar.gz" \
+  | tar -xzf - -C /tmp/nvim_home --strip-components=1
+printf 'NVIM_OK %s linux-%s\n' "$_nv" "$_na"
+NVIM_DL
+    _nvim_dl_pid=$!
   fi
 
-  # ── bundle ALL files into ONE tar, pipe over ControlMaster ────────
-  # one TCP transfer instead of N parallel scp connections
-  echo ""
-  echo "📦 Bundling and transferring..."
+  # ── bundle all files into one tar, pipe over ControlMaster ────────
+  # one transfer instead of N scp handshakes; stage dir gives files correct names
+  printf '\n📦 Bundling and transferring...\n'
+  local _stage; _stage=$(mktemp -d /tmp/sssh_stage.XXXXXX)
 
-  local bundle_files=("$tmp_env")
-  local bundle_names=(".sssh_env")
-  for i in "${!to_copy[@]}"; do
-    bundle_files+=("${to_copy_paths[$i]}")
-    bundle_names+=("${to_copy[$i]}")
+  # SEC: copy binaries with explicit 755 — avoids propagating setuid bits
+  cp "$_tmp_env" "$_stage/.sssh_env"
+  local _i; for _i in "${!_to_copy[@]}"; do
+    install -m 755 "${_to_paths[$_i]}" "$_stage/${_to_copy[$_i]}"
   done
+  rm -f "$_tmp_env"
 
-  # create bundle: rename files to their target names during tar
-  # tar -C srcdir file works but we need different source and dest names
-  # solution: copy to a staging dir with target names, tar that
-  local stage_dir; stage_dir=$(mktemp -d /tmp/sssh_stage.XXXXXX)
-  cp "$tmp_env" "$stage_dir/.sssh_env"
-  for i in "${!to_copy[@]}"; do
-    cp "${to_copy_paths[$i]}" "$stage_dir/${to_copy[$i]}"
-  done
-  rm -f "$tmp_env"
-
-  # pipe tar bundle through ControlMaster — single SSH connection
-  local transferred=() failed=()
-  if tar -czf - -C "$stage_dir" . \
-      | ssh "${cm_opts[@]}" "$host" \
-          "tar -xzf - -C /tmp && chmod +x $(printf '/tmp/%s ' "${to_copy[@]}") 2>/dev/null; echo BUNDLE_OK"; then
-    echo "  ✓  bundle transferred ($(du -sh "$stage_dir" 2>/dev/null | cut -f1) compressed)"
-    transferred=("${to_copy[@]}" ".sssh_env")
+  local _stage_size; _stage_size=$(du -sh "$_stage" 2>/dev/null | cut -f1)
+  if tar -czf - -C "$_stage" . \
+      | ssh "${_cm_opts[@]}" "$_host" \
+          "tar -xzf - -C /tmp && chmod 600 /tmp/.sssh_env; printf 'BUNDLE_OK\n'"; then
+    printf '  ✓  transferred (%s)\n' "$_stage_size"
   else
-    echo "  ✗  bundle transfer failed"
-    failed=("${to_copy[@]}")
+    printf '  ✗  transfer failed\n'
   fi
-  rm -rf "$stage_dir"
+  rm -rf "$_stage"
 
-  # ── verify binaries — static with musl fallback, dynamic check ────
-  local verify_script='
-_sssh_get_ver() {
+  # ── verify binaries via stdin (SEC: avoids single-quote injection) ─
+  local _verify_script
+  _verify_script=$(cat << 'VERIFY_HDR'
+_sssh_ver() {
   curl -sL "https://api.github.com/repos/$1/releases/latest" \
-    | grep "\"tag_name\"" | head -1 | cut -d"\"" -f4 | tr -d "v"
+    | grep '"tag_name"' | head -1 | cut -d'"' -f4 | tr -d v
 }
 _sssh_musl() {
-  local b="$1" a=$(uname -m)
-  case "$b" in
-    bat) v=$(_sssh_get_ver sharkdp/bat)
-      case $a in
-        x86_64)  u="https://github.com/sharkdp/bat/releases/download/v${v}/bat-v${v}-x86_64-unknown-linux-musl.tar.gz" ;;
-        aarch64) u="https://github.com/sharkdp/bat/releases/download/v${v}/bat-v${v}-aarch64-unknown-linux-musl.tar.gz" ;;
-      esac; curl -sL "$u" | tar -xzf - --wildcards --strip-components=1 -O "*/bat" > /tmp/bat ;;
-    rg) v=$(_sssh_get_ver BurntSushi/ripgrep)
-      case $a in
-        x86_64)  u="https://github.com/BurntSushi/ripgrep/releases/download/${v}/ripgrep-${v}-x86_64-unknown-linux-musl.tar.gz" ;;
-        aarch64) u="https://github.com/BurntSushi/ripgrep/releases/download/${v}/ripgrep-${v}-aarch64-unknown-linux-musl.tar.gz" ;;
-      esac; curl -sL "$u" | tar -xzf - --wildcards --strip-components=1 -O "*/rg" > /tmp/rg ;;
-    fd) v=$(_sssh_get_ver sharkdp/fd)
-      case $a in
-        x86_64)  u="https://github.com/sharkdp/fd/releases/download/v${v}/fd-v${v}-x86_64-unknown-linux-musl.tar.gz" ;;
-        aarch64) u="https://github.com/sharkdp/fd/releases/download/v${v}/fd-v${v}-aarch64-unknown-linux-musl.tar.gz" ;;
-      esac; curl -sL "$u" | tar -xzf - --wildcards --strip-components=1 -O "*/fd" > /tmp/fd ;;
-    fzf) v=$(_sssh_get_ver junegunn/fzf)
-      case $a in
-        x86_64)  u="https://github.com/junegunn/fzf/releases/download/v${v}/fzf-${v}-linux_amd64.tar.gz" ;;
-        aarch64) u="https://github.com/junegunn/fzf/releases/download/v${v}/fzf-${v}-linux_arm64.tar.gz" ;;
-      esac; curl -sL "$u" | tar -xzf - -O fzf > /tmp/fzf ;;
+  local _b="$1" _a; _a=$(uname -m)
+  local _v _u
+  case "$_b" in
+    bat) _v=$(_sssh_ver sharkdp/bat)
+      case $_a in
+        x86_64)  _u="https://github.com/sharkdp/bat/releases/download/v${_v}/bat-v${_v}-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64) _u="https://github.com/sharkdp/bat/releases/download/v${_v}/bat-v${_v}-aarch64-unknown-linux-musl.tar.gz" ;;
+      esac
+      curl -sL "$_u" | tar -xzf - --wildcards --strip-components=1 -O '*/bat' > /tmp/bat ;;
+    rg) _v=$(_sssh_ver BurntSushi/ripgrep)
+      case $_a in
+        x86_64)  _u="https://github.com/BurntSushi/ripgrep/releases/download/${_v}/ripgrep-${_v}-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64) _u="https://github.com/BurntSushi/ripgrep/releases/download/${_v}/ripgrep-${_v}-aarch64-unknown-linux-musl.tar.gz" ;;
+      esac
+      curl -sL "$_u" | tar -xzf - --wildcards --strip-components=1 -O '*/rg' > /tmp/rg ;;
+    fd) _v=$(_sssh_ver sharkdp/fd)
+      case $_a in
+        x86_64)  _u="https://github.com/sharkdp/fd/releases/download/v${_v}/fd-v${_v}-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64) _u="https://github.com/sharkdp/fd/releases/download/v${_v}/fd-v${_v}-aarch64-unknown-linux-musl.tar.gz" ;;
+      esac
+      curl -sL "$_u" | tar -xzf - --wildcards --strip-components=1 -O '*/fd' > /tmp/fd ;;
+    fzf) _v=$(_sssh_ver junegunn/fzf)
+      case $_a in
+        x86_64)  _u="https://github.com/junegunn/fzf/releases/download/v${_v}/fzf-${_v}-linux_amd64.tar.gz" ;;
+        aarch64) _u="https://github.com/junegunn/fzf/releases/download/v${_v}/fzf-${_v}-linux_arm64.tar.gz" ;;
+      esac
+      curl -sL "$_u" | tar -xzf - -O fzf > /tmp/fzf ;;
   esac
-  chmod +x "/tmp/$b" 2>/dev/null
+  chmod +x "/tmp/$_b" 2>/dev/null
 }
-'
-  echo ""
-  echo "🔍 Verifying..."
-  for i in "${!to_copy[@]}"; do
-    local bin="${to_copy[$i]}" type="${to_copy_types[$i]}"
-    if [[ "$type" == "STATIC" ]]; then
-      verify_script+="
-        if /tmp/$bin --version >/dev/null 2>&1 || /tmp/$bin --help >/dev/null 2>&1; then
-          echo \"OK $bin\"
-        else
-          _sssh_musl $bin
-          /tmp/$bin --version >/dev/null 2>&1 && echo \"OK_MUSL $bin\" || { echo \"FAILED $bin\"; rm -f /tmp/$bin; }
-        fi"
+VERIFY_HDR
+)
+
+  printf '\n🔍 Verifying...\n'
+  for _i in "${!_to_copy[@]}"; do
+    local _b="${_to_copy[$_i]}" _t="${_to_types[$_i]}"
+    if [[ "$_t" == STATIC ]]; then
+      _verify_script+="
+/tmp/${_b} --version >/dev/null 2>&1 || /tmp/${_b} --help >/dev/null 2>&1 \
+  && printf 'OK ${_b}\n' \
+  || { _sssh_musl ${_b}; /tmp/${_b} --version >/dev/null 2>&1 \
+    && printf 'OK_MUSL ${_b}\n' || { printf 'FAILED ${_b}\n'; rm -f /tmp/${_b}; }; }"
     else
-      verify_script+="
-        /tmp/$bin --version >/dev/null 2>&1 || /tmp/$bin -h >/dev/null 2>&1 \
-          && echo \"OK $bin\" || { echo \"BROKEN $bin\"; rm -f /tmp/$bin; }"
+      _verify_script+="
+/tmp/${_b} --version >/dev/null 2>&1 || /tmp/${_b} -h >/dev/null 2>&1 \
+  && printf 'OK ${_b}\n' || { printf 'BROKEN ${_b}\n'; rm -f /tmp/${_b}; }"
     fi
   done
-  verify_script+="
-unset -f _sssh_get_ver _sssh_musl"
+  _verify_script+="
+unset -f _sssh_ver _sssh_musl"
 
-  while IFS= read -r result; do
-    local bin="${result#* }"
-    case "$result" in
-      OK_MUSL*) echo "  ✓  $bin (musl)" ;;
-      OK*)      echo "  ✓  $bin" ;;
-      BROKEN*)  echo "  ✗  $bin (deps missing, removed)" ;;
-      FAILED*)  echo "  ✗  $bin (failed, removed)" ;;
+  while IFS= read -r _r; do
+    case "$_r" in
+      OK_MUSL*) printf '  ✓  %s (musl fallback)\n' "${_r#* }" ;;
+      OK*)      printf '  ✓  %s\n'                 "${_r#* }" ;;
+      BROKEN*)  printf '  ✗  %s (deps missing)\n'  "${_r#* }" ;;
+      FAILED*)  printf '  ✗  %s (failed)\n'        "${_r#* }" ;;
     esac
-  done < <(ssh "${cm_opts[@]}" "$host" "bash -c '$verify_script'" 2>/dev/null)
+  done < <(printf '%s\n' "$_verify_script" | ssh "${_cm_opts[@]}" "$_host" bash -s 2>/dev/null)
 
   # ── sync nvim config + plugins ────────────────────────────────────
-  if $copy_nvim; then
-    echo ""
-    echo "🔄 Syncing nvim config..."
-    ssh "${cm_opts[@]}" "$host" "mkdir -p \
-      $nvim_remote_home/.config $nvim_remote_home/.local/share/nvim \
-      $nvim_remote_home/.local/state/nvim $nvim_remote_home/.cache/nvim" 2>/dev/null
+  if $_copy_nvim; then
+    printf '\n🔄 Syncing nvim config...\n'
+    ssh "${_cm_opts[@]}" "$_host" \
+      "mkdir -p $_nvim_rdir/.config $_nvim_rdir/.local/share/nvim \
+                $_nvim_rdir/.local/state/nvim $_nvim_rdir/.cache/nvim" 2>/dev/null
 
-    local mason_disable="$nvim_config_dir/lua/plugins/sssh_remote.lua"
-    cat > "$mason_disable" << 'LUA'
+    # inject mason-disable plugin before syncing so it lands on remote
+    local _mdisable="$_nvim_cfg/lua/plugins/sssh_remote.lua"
+    cat > "$_mdisable" << 'LUA'
+-- auto-generated by sssh — disables mason/LSP on remote (no internet, wrong arch)
 return {
   { "williamboman/mason.nvim",                   enabled = false },
   { "williamboman/mason-lspconfig.nvim",         enabled = false },
@@ -507,67 +492,81 @@ return {
 LUA
 
     _sssh_sync() {
-      local src="$1" dst="$2" label="$3" flags="${4:-}"
-      if command -v rsync &>/dev/null; then
+      local _src="$1" _dst="$2" _lbl="$3" _flags="${4:-}"
+      if command -v rsync >/dev/null 2>&1; then
         # shellcheck disable=SC2086
-        rsync -az $flags --info=progress2 \
-          -e "ssh ${cm_opts[*]}" "$src" "$host:$dst" \
-          && echo "  ✓  $label" || echo "  ✗  $label"
+        rsync -az $_flags --info=progress2 \
+          -e "ssh ${_cm_opts[*]}" "$_src" "$_host:$_dst" \
+          && printf '  ✓  %s\n' "$_lbl" || printf '  ✗  %s\n' "$_lbl"
       else
-        tar -czf - -C "$(dirname "$src")" "$(basename "$src")" \
-          | ssh "${cm_opts[@]}" "$host" "mkdir -p $dst && tar -xzf - -C $dst" \
-          && echo "  ✓  $label" || echo "  ✗  $label"
+        tar -czf - -C "$(dirname "$_src")" "$(basename "$_src")" \
+          | ssh "${_cm_opts[@]}" "$_host" "mkdir -p $_dst && tar -xzf - -C $_dst" \
+          && printf '  ✓  %s\n' "$_lbl" || printf '  ✗  %s\n' "$_lbl"
       fi
     }
 
-    _sssh_sync "$nvim_config_dir" "$nvim_remote_home/.config/" "nvim config"
+    _sssh_sync "$_nvim_cfg" "$_nvim_rdir/.config/" "nvim config"
 
-    if $copy_plugins && [ -d "$nvim_plugins_dir" ]; then
-      echo "🔄 Syncing nvim plugins..."
-      local so_flags=""
-      $same_arch || so_flags="--exclude='*.so' --exclude='parser/' --exclude='build/'"
-      _sssh_sync "$nvim_plugins_dir" "$nvim_remote_home/.local/share/nvim/" "nvim plugins" "$so_flags"
+    if $_copy_plugins && [[ -d "$_nvim_lazy" ]]; then
+      printf '🔄 Syncing nvim plugins...\n'
+      local _so=""
+      $_same_arch || _so="--exclude='*.so' --exclude='parser/' --exclude='build/'"
+      _sssh_sync "$_nvim_lazy" "$_nvim_rdir/.local/share/nvim/" "nvim plugins" "$_so"
     fi
 
-    rm -f "$mason_disable"
+    rm -f "$_mdisable"
     unset -f _sssh_sync
 
-    echo ""
-    echo "⬇  Waiting for nvim download..."
-    if wait "$nvim_dl_pid" 2>/dev/null; then
-      grep -q "NVIM_OK" /tmp/sssh_nvim_dl.log 2>/dev/null \
-        && echo "  ✓  nvim $(grep NVIM_OK /tmp/sssh_nvim_dl.log | awk '{print $2,$3}')" \
-        || { echo "  ✗  nvim download failed:"; sed 's/^/     /' /tmp/sssh_nvim_dl.log; }
+    printf '\n⬇  Waiting for nvim download...\n'
+    if wait "$_nvim_dl_pid" 2>/dev/null; then
+      grep -q NVIM_OK /tmp/sssh_nvim_dl.log 2>/dev/null \
+        && printf '  ✓  nvim %s\n' "$(awk '/NVIM_OK/{print $2,$3}' /tmp/sssh_nvim_dl.log)" \
+        || { printf '  ✗  nvim download failed:\n'; sed 's/^/     /' /tmp/sssh_nvim_dl.log; }
     fi
     rm -f /tmp/sssh_nvim_dl.log
 
-    if $copy_plugins && ! $same_arch; then
-      echo "🔨 Recompiling treesitter parsers..."
-      ssh "${cm_opts[@]}" "$host" "
-        XDG_CONFIG_HOME=$nvim_remote_home/.config \
-        XDG_DATA_HOME=$nvim_remote_home/.local/share \
-        XDG_STATE_HOME=$nvim_remote_home/.local/state \
-        XDG_CACHE_HOME=$nvim_remote_home/.cache \
-          $nvim_remote_home/bin/nvim --headless -c 'TSUpdateSync' -c 'qa' 2>/dev/null
-      " && echo "  ✓  parsers recompiled" || echo "  ⚠  recompile had errors"
+    if $_copy_plugins && ! $_same_arch; then
+      printf '🔨 Recompiling treesitter parsers (arch mismatch)...\n'
+      ssh "${_cm_opts[@]}" "$_host" \
+        "XDG_CONFIG_HOME=$_nvim_rdir/.config \
+         XDG_DATA_HOME=$_nvim_rdir/.local/share \
+         XDG_STATE_HOME=$_nvim_rdir/.local/state \
+         XDG_CACHE_HOME=$_nvim_rdir/.cache \
+         $_nvim_rdir/bin/nvim --headless -c 'TSUpdateSync' -c 'qa' 2>/dev/null" \
+        && printf '  ✓  parsers recompiled\n' \
+        || printf '  ⚠  recompile errors (gcc may be missing)\n'
     fi
   fi
 
-  echo ""
-  echo "✓ Connecting..."
+  # ── guardian: cleans up if session dies without triggering EXIT ───
+  # (SIGKILL, network drop, OOM) — fires after 2h max regardless
+  # written as a real script file — avoids quote-nesting where $_cleanup_cmd
+  # (local variable) would be trapped inside single quotes and never expand
+  # clean exit: trap fires → removes /tmp/.sssh_pid → guardian exits quietly
+  printf '\n✓  Connecting...\n'
 
-  local connect_cmd
-  [[ "$remote_shell" == *bash ]] \
-    && connect_cmd="exec $remote_shell --rcfile /tmp/.sssh_env" \
-    || connect_cmd="ENV=/tmp/.sssh_env exec $remote_shell -i"
+  # write guardian script to remote then launch it detached
+  # printf handles the expansion correctly: $_cleanup_cmd expands locally (good),
+  # $(...) and $var inside the script body stay literal (good)
+  ssh "${_cm_opts[@]}" "$_host" bash -s << GUARDIAN
+cat > /tmp/.sssh_guardian << 'SCRIPT'
+#!/bin/bash
+_timeout=7200; _elapsed=0
+for _i in \$(seq 300); do [ -f /tmp/.sssh_pid ] && break; sleep 0.1; done
+_spid=\$(cat /tmp/.sssh_pid 2>/dev/null)
+[ -z "\$_spid" ] && { rm -f /tmp/.sssh_guardian; exit 0; }
+while kill -0 "\$_spid" 2>/dev/null && [ -f /tmp/.sssh_pid ]; do
+  sleep 5; _elapsed=\$((_elapsed+5)); [ \$_elapsed -ge \$_timeout ] && break
+done
+sleep 2
+[ -f /tmp/.sssh_pid ] && { $_cleanup_cmd; rm -f /tmp/.sssh_pid; }
+rm -f /tmp/.sssh_guardian
+SCRIPT
+chmod +x /tmp/.sssh_guardian
+nohup /tmp/.sssh_guardian </dev/null >/dev/null 2>&1 &
+GUARDIAN
 
-  ssh -t "${cm_opts[@]}" "$host" "
-    trap '$cleanup; [ -f /tmp/.sssh_atjob ] && atrm \$(cat /tmp/.sssh_atjob) 2>/dev/null' EXIT
-    export PATH=/tmp:\$PATH
-    $connect_cmd
-  "
-
-  unset -f _sssh_cleanup_cm
+  _sssh_connect
 }
 
 # Utilities
