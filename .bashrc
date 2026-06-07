@@ -218,29 +218,54 @@ alias vi='nvim'
 NVIMALIAS
   fi
 
-  # ── alias filter — appended into env file, runs on source ────────
-  # dynamically removes aliases whose commands aren't on the remote
-  # checks ALL command tokens (handles compound aliases with && ||)
-  cat >> "$tmp_env" << 'ALIAS_FILTER'
+  # ── env filter — appended into env file, runs on source ─────────
+  # 1. purge plugin-injected functions (zoxide, fzf, etc.) that won't work without their tools
+  # 2. remove aliases whose commands aren't on this server (checks ALL tokens: &&, ||, |)
+  # 3. reset completions bound to now-missing functions (fixes compgen -V tab error)
+  cat >> "$tmp_env" << 'ENV_FILTER'
+
+# ── sssh: purge plugin functions that require tools not on this server ──
+_sssh_purge_plugins() {
+  local _patterns=(
+    '^_zoxide' '^__zoxide' '^zd$'          # zoxide
+    '^_z$' '^__z$' '^_z_'                  # z.sh
+    '^_fzf_' '^__fzf_'                     # fzf shell integration
+    '^_fasd' '^fasd'                        # fasd
+    '^_autojump' '^autojump'               # autojump
+    '^_zellij' '^__zellij'                 # zellij
+    '^_atuin' '^__atuin'                   # atuin
+  )
+  local _funcs _func _pat _removed=()
+  _funcs=$(declare -F | awk '{print $3}')
+  while IFS= read -r _func; do
+    for _pat in "${_patterns[@]}"; do
+      if echo "$_func" | grep -qE "$_pat"; then
+        unset -f "$_func" 2>/dev/null
+        _removed+=("$_func")
+        break
+      fi
+    done
+  done <<< "$_funcs"
+  [ ${#_removed[@]} -gt 0 ] && \
+    echo "sssh: removed ${#_removed[@]} plugin functions: ${_removed[*]}"
+
+  # clean PROMPT_COMMAND of plugin hooks
+  PROMPT_COMMAND=$(printf '%s' "$PROMPT_COMMAND" | \
+    tr ';' '\n' | grep -vE '_zoxide_hook|__zoxide|_z_hook|atuin|__bp_' | \
+    grep -v '^[[:space:]]*$' | paste -sd ';' -)
+}
 
 # ── sssh: remove aliases whose commands aren't available on this server ──
 _sssh_filter_aliases() {
   local _name _body _cmds _cmd _skipped=()
-
   for _name in $(alias | sed "s/alias \([^=]*\)=.*/\1/"); do
     _body=$(alias "$_name" 2>/dev/null | sed "s/alias $_name=//;s/^'//;s/'$//")
-
-    # extract all command-position tokens: after start, &&, ||, |, ;, $(
     _cmds=$(echo "$_body" | \
       sed 's/&&/\n/g; s/||/\n/g; s/|/\n/g; s/;/\n/g; s/\$(/\n/g' | \
-      awk '{print $1}' | \
-      grep -oE '[a-zA-Z_][a-zA-Z0-9_-]+' | \
-      sort -u)
-
+      awk '{print $1}' | grep -oE '[a-zA-Z_][a-zA-Z0-9_-]+' | sort -u)
     local _missing=""
     while IFS= read -r _cmd; do
       [ -z "$_cmd" ] && continue
-      # skip shell builtins, keywords, and always-present coreutils
       case "$_cmd" in
         cd|echo|printf|source|export|local|return|true|false|test|if|then|else|\
         do|done|while|for|in|case|esac|fi|time|sudo|grep|awk|sed|sort|cut|\
@@ -251,21 +276,35 @@ _sssh_filter_aliases() {
       command -v "$_cmd" &>/dev/null && continue
       _missing="$_cmd"; break
     done <<< "$_cmds"
-
     if [ -n "$_missing" ]; then
-      _skipped+=("$_name($_missing)")
-      unalias "$_name" 2>/dev/null
+      _skipped+=("$_name($_missing)"); unalias "$_name" 2>/dev/null
     fi
   done
-
   if [ ${#_skipped[@]} -gt 0 ]; then
     echo "sssh: skipped ${#_skipped[@]} aliases (commands not on this server):"
     local _s; for _s in "${_skipped[@]}"; do echo "  ✗  $_s"; done
   fi
 }
+
+# ── sssh: reset completions bound to functions that no longer exist ──
+_sssh_clean_completions() {
+  while IFS= read -r _line; do
+    local _func _cmd
+    _func=$(echo "$_line" | grep -oE '\-F \S+' | awk '{print $2}')
+    _cmd=$(echo "$_line" | awk '{print $NF}')
+    [ -z "$_func" ] && continue
+    declare -f "$_func" &>/dev/null && continue
+    complete -r "$_cmd" 2>/dev/null
+  done < <(complete -p 2>/dev/null)
+  # always reset cd — zoxide, autojump, z.sh all hijack it
+  complete -r cd 2>/dev/null
+}
+
+_sssh_purge_plugins
 _sssh_filter_aliases
-unset -f _sssh_filter_aliases
-ALIAS_FILTER
+_sssh_clean_completions
+unset -f _sssh_purge_plugins _sssh_filter_aliases _sssh_clean_completions
+ENV_FILTER
 
   # ── build cleanup list ────────────────────────────────────────────
   local clean_list=("/tmp/.sssh_env" "/tmp/.sssh_atjob")
