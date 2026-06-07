@@ -91,11 +91,19 @@ sssh() {
     [ps]="DYNAMIC"      [netstat]="DYNAMIC" [tcpdump]="DYNAMIC"
     [nmap]="DYNAMIC"    [htop]="DYNAMIC"    [vim]="DYNAMIC"
     [fzf]="STATIC"      [bat]="STATIC"      [fd]="STATIC"
-    [rg]="STATIC"       [eza]="DYNAMIC"     [mise]="DYNAMIC"
+    [rg]="STATIC"
   )
-  local bins=(bash curl wget less ps netstat tcpdump nmap htop vim fzf bat fd rg eza mise)
-  local max_bundled_deps=8  # bins with more deps than this: verify-only, no bundling
 
+  # musl fallback: if a STATIC binary fails on remote, download musl build instead
+  # format: [bin]="github_owner/repo|binary_name_in_tarball|tarball_pattern_x86|tarball_pattern_arm"
+  local -A musl_fallback=(
+    [bat]="sharkdp/bat|bat|bat-v{ver}-x86_64-unknown-linux-musl.tar.gz|bat-v{ver}-aarch64-unknown-linux-musl.tar.gz"
+    [rg]="BurntSushi/ripgrep|rg|ripgrep-{ver}-x86_64-unknown-linux-musl.tar.gz|ripgrep-{ver}-aarch64-unknown-linux-musl.tar.gz"
+    [fd]="sharkdp/fd|fd|fd-v{ver}-x86_64-unknown-linux-musl.tar.gz|fd-v{ver}-aarch64-unknown-linux-musl.tar.gz"
+    [eza]="eza-community/eza|eza|eza_x86_64-unknown-linux-musl.tar.gz|eza_aarch64-unknown-linux-musl.tar.gz"
+  )
+
+  local bins=(bash curl wget less ps netstat tcpdump nmap htop vim fzf bat fd rg)
   local nvim_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/nvim"
   local nvim_plugins_dir="${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy"
   local nvim_remote_home="/tmp/nvim_home"
@@ -116,7 +124,6 @@ sssh() {
       *)           host="$arg" ;;
     esac
   done
-
   [ -z "$host" ] && { sssh --help; return 1; }
 
   # ── detect remote shell + arch in one call ────────────────────────
@@ -128,42 +135,20 @@ sssh() {
   [ -z "$remote_shell" ] && { echo "✗ Could not detect remote shell"; return 1; }
   echo "🐚 Remote: $remote_shell on $remote_arch"
 
-  local local_arch
-  local_arch=$(uname -m)
+  local local_arch; local_arch=$(uname -m)
   local same_arch=false
   [ "$local_arch" = "$remote_arch" ] && same_arch=true
-  $same_arch && echo "✓ Arch match ($local_arch) — compiled files (.so) are portable" \
-             || echo "⚠ Arch mismatch ($local_arch → $remote_arch) — .so files will be excluded, parsers recompiled"
+  $same_arch \
+    && echo "✓ Arch match ($local_arch)" \
+    || echo "⚠ Arch mismatch ($local_arch → $remote_arch) — .so files excluded, parsers recompiled"
 
   # ── check what remote already has ────────────────────────────────
   local check_script="for bin in ${bins[*]}; do command -v \"\$bin\" &>/dev/null && echo \"HAS \$bin\" || echo \"MISSING \$bin\"; done"
   local remote_status
   remote_status=$(ssh "$host" "$check_script" 2>/dev/null)
 
-  # ── dep resolver: finds non-standard .so files needed by a binary ──
-  # "non-standard" = not in the baseline set every Linux distro ships
-  _sssh_get_deps() {
-    local bin_path="$1"
-    local always=(
-      "linux-vdso" "libm.so" "libc.so" "libdl.so" "libpthread.so"
-      "librt.so"   "libutil.so" "libgcc_s.so" "ld-linux" "ld-musl"
-    )
-    ldd "$bin_path" 2>/dev/null | while read -r line; do
-      local sopath; sopath=$(echo "$line" | awk '{print $3}')
-      [ ! -f "$sopath" ] && continue
-      local soname; soname=$(echo "$line" | awk '{print $1}')
-      local skip=false
-      for base in "${always[@]}"; do [[ "$soname" == ${base}* ]] && { skip=true; break; }; done
-      $skip && continue
-      echo "$sopath"
-    done | sort -u
-  }
-
   # ── plan binary copies ────────────────────────────────────────────
   local to_copy=() to_copy_paths=() to_copy_types=()
-  local to_bundle_deps=()   # parallel array: space-separated dep paths per bin
-  local all_dep_paths=()    # flat list of all unique .so files to copy
-
   echo ""
   echo "📋 Planning..."
   while IFS= read -r line; do
@@ -173,64 +158,33 @@ sssh() {
     elif $remote_has;              then echo "  ✓  $bin — already on remote"
     else
       local local_path; local_path=$(which "$bin" 2>/dev/null)
-      if [ -z "$local_path" ]; then
-        echo "  -  $bin — not found locally"
+      if [ -z "$local_path" ]; then echo "  -  $bin — not found locally"
       else
-        if [[ "$type" == "DYNAMIC" ]]; then
-          # resolve deps and decide: bundle or verify-only
-          local deps; deps=$(_sssh_get_deps "$local_path")
-          local dep_count; dep_count=$(echo "$deps" | grep -c . || echo 0)
-
-          if [ "$dep_count" -eq 0 ]; then
-            echo "  →  $bin [DYNAMIC/no-extra-deps] will be copied"
-            to_bundle_deps+=("")
-          elif [ "$dep_count" -le "$max_bundled_deps" ]; then
-            echo "  →  $bin [DYNAMIC/$dep_count deps] will be copied + libs bundled"
-            echo "$deps" | while read -r d; do echo "       lib: $(basename $d)"; done
-            # add to flat dep list (deduplicated)
-            while read -r d; do
-              [[ " ${all_dep_paths[*]} " != *" $d "* ]] && all_dep_paths+=("$d")
-            done <<< "$deps"
-            to_bundle_deps+=("$deps")
-          else
-            echo "  →  $bin [DYNAMIC/$dep_count deps — too many to bundle] copy + verify"
-            to_bundle_deps+=("TOO_MANY")
-          fi
-        else
-          echo "  →  $bin [STATIC] will be copied"
-          to_bundle_deps+=("")
-        fi
+        echo "  →  $bin [$type] will be copied"
         to_copy+=("$bin"); to_copy_paths+=("$local_path"); to_copy_types+=("$type")
       fi
     fi
   done <<< "$remote_status"
-
-  # report bundled libs
-  if [ ${#all_dep_paths[@]} -gt 0 ]; then
-    echo "  →  ${#all_dep_paths[@]} shared libs will be bundled → /tmp/lib/"
-  fi
 
   # ── plan nvim ─────────────────────────────────────────────────────
   if $copy_nvim; then
     echo ""
     echo "📋 Planning nvim..."
     if [ ! -d "$nvim_config_dir" ]; then
-      echo "  ✗ ~/.config/nvim not found — disabling --nvim"
-      copy_nvim=false
+      echo "  ✗ ~/.config/nvim not found — disabling --nvim"; copy_nvim=false
     else
       local cfg_size; cfg_size=$(du -sh "$nvim_config_dir" 2>/dev/null | cut -f1)
       echo "  →  nvim binary — will download on remote (correct arch, bundled runtime)"
       echo "  →  config (~$cfg_size) will be synced"
       if $copy_plugins; then
         if [ ! -d "$nvim_plugins_dir" ]; then
-          echo "  -  plugins dir not found — skipping plugins"
-          copy_plugins=false
+          echo "  -  plugins not found — skipping"; copy_plugins=false
         else
           local pl_size; pl_size=$(du -sh "$nvim_plugins_dir" 2>/dev/null | cut -f1)
           echo "  →  plugins (~$pl_size) will be synced"
           $same_arch \
-            && echo "       (.so files included — same arch)" \
-            || echo "       (.so files excluded — parsers will recompile on remote, needs gcc)"
+            && echo "       (same arch — .so included)" \
+            || echo "       (arch mismatch — .so excluded, will recompile)"
         fi
       fi
     fi
@@ -239,14 +193,16 @@ sssh() {
   # ── build env file ────────────────────────────────────────────────
   local tmp_env; tmp_env=$(mktemp /tmp/sssh_env.XXXXXX)
 
-  # source remote's own shell config first — our aliases override after
+  # source remote's own shell config first — our aliases come after and override
   cat >> "$tmp_env" << 'HEADER'
 [ -f ~/.bashrc ]  && source ~/.bashrc  2>/dev/null
 [ -f ~/.profile ] && source ~/.profile 2>/dev/null
 HEADER
 
+  # live aliases — exactly what's active right now, no parsing
   alias >> "$tmp_env"; echo "" >> "$tmp_env"
 
+  # user-defined functions (subtract clean-bash baseline)
   local clean_funcs current_funcs user_funcs
   clean_funcs=$(bash --norc --noprofile -c 'declare -F' 2>/dev/null | awk '{print $3}')
   current_funcs=$(declare -F | awk '{print $3}')
@@ -254,7 +210,7 @@ HEADER
   [ -n "$user_funcs" ] && declare -f $user_funcs >> "$tmp_env"
   echo "" >> "$tmp_env"
 
-  # inject nvim alias with all XDG vars pointing to /tmp/nvim_home
+  # inject nvim alias if copying nvim
   if $copy_nvim; then
     cat >> "$tmp_env" << NVIMALIAS
 alias nvim='XDG_CONFIG_HOME=$nvim_remote_home/.config XDG_DATA_HOME=$nvim_remote_home/.local/share XDG_STATE_HOME=$nvim_remote_home/.local/state XDG_CACHE_HOME=$nvim_remote_home/.cache $nvim_remote_home/bin/nvim'
@@ -262,15 +218,62 @@ alias vi='nvim'
 NVIMALIAS
   fi
 
-  # build cleanup list
-  local clean_list=("/tmp/.sssh_env" "/tmp/.sssh_atjob" "/tmp/lib")
-  for bin in "${to_copy[@]}"; do
-    clean_list+=("/tmp/$bin" "/tmp/.${bin}.bin")  # wrapper + hidden real binary
+  # ── alias filter — appended into env file, runs on source ────────
+  # dynamically removes aliases whose commands aren't on the remote
+  # checks ALL command tokens (handles compound aliases with && ||)
+  cat >> "$tmp_env" << 'ALIAS_FILTER'
+
+# ── sssh: remove aliases whose commands aren't available on this server ──
+_sssh_filter_aliases() {
+  local _name _body _cmds _cmd _skipped=()
+
+  for _name in $(alias | sed "s/alias \([^=]*\)=.*/\1/"); do
+    _body=$(alias "$_name" 2>/dev/null | sed "s/alias $_name=//;s/^'//;s/'$//")
+
+    # extract all command-position tokens: after start, &&, ||, |, ;, $(
+    _cmds=$(echo "$_body" | \
+      sed 's/&&/\n/g; s/||/\n/g; s/|/\n/g; s/;/\n/g; s/\$(/\n/g' | \
+      awk '{print $1}' | \
+      grep -oE '[a-zA-Z_][a-zA-Z0-9_-]+' | \
+      sort -u)
+
+    local _missing=""
+    while IFS= read -r _cmd; do
+      [ -z "$_cmd" ] && continue
+      # skip shell builtins, keywords, and always-present coreutils
+      case "$_cmd" in
+        cd|echo|printf|source|export|local|return|true|false|test|if|then|else|\
+        do|done|while|for|in|case|esac|fi|time|sudo|grep|awk|sed|sort|cut|\
+        head|tail|xargs|find|tar|mkdir|rm|cp|mv|cat|wc|read|history|ps|\
+        unset|shift|set|trap|wait|exec|eval|type|command|hash|pwd|env)
+          continue ;;
+      esac
+      command -v "$_cmd" &>/dev/null && continue
+      _missing="$_cmd"; break
+    done <<< "$_cmds"
+
+    if [ -n "$_missing" ]; then
+      _skipped+=("$_name($_missing)")
+      unalias "$_name" 2>/dev/null
+    fi
   done
+
+  if [ ${#_skipped[@]} -gt 0 ]; then
+    echo "sssh: skipped ${#_skipped[@]} aliases (commands not on this server):"
+    local _s; for _s in "${_skipped[@]}"; do echo "  ✗  $_s"; done
+  fi
+}
+_sssh_filter_aliases
+unset -f _sssh_filter_aliases
+ALIAS_FILTER
+
+  # ── build cleanup list ────────────────────────────────────────────
+  local clean_list=("/tmp/.sssh_env" "/tmp/.sssh_atjob")
+  for bin in "${to_copy[@]}"; do clean_list+=("/tmp/$bin"); done
   $copy_nvim && clean_list+=("$nvim_remote_home")
   local cleanup="rm -rf ${clean_list[*]}"
 
-  # append at-job fallback cleanup into env file (no heredoc/stdin issues)
+  # append at-job fallback cleanup
   cat >> "$tmp_env" << SETUP
 
 # ── sssh: fallback cleanup after 24h ──
@@ -287,68 +290,45 @@ SETUP
   local alias_count func_count
   alias_count=$(grep -c '^alias' "$tmp_env" 2>/dev/null || echo 0)
   func_count=$(echo "$user_funcs" | grep -c '.' 2>/dev/null || echo 0)
-  echo "  →  env snapshot: $alias_count aliases, $func_count functions"
+  echo "  →  env snapshot: $alias_count aliases, $func_count functions (filtered on remote)"
 
   # ── pre-clean remote ──────────────────────────────────────────────
   ssh "$host" "rm -rf ${clean_list[*]}" 2>/dev/null
 
-  # ── download nvim on remote IN BACKGROUND (runs while we rsync) ──
+  # ── start nvim download on remote in background ───────────────────
   local nvim_dl_pid=""
   if $copy_nvim; then
     echo ""
     echo "⬇  Downloading nvim on remote (background)..."
-    local nvim_setup_script
-    nvim_setup_script=$(cat << REMOTENVIM
+    ssh "$host" "bash -s" << 'REMOTENVIM' > /tmp/sssh_nvim_dl.log 2>&1 &
 set -e
-NVIM_REMOTE_HOME="$nvim_remote_home"
-REMOTE_ARCH=\$(uname -m)
-case "\$REMOTE_ARCH" in
+NVIM_REMOTE_HOME="/tmp/nvim_home"
+case "$(uname -m)" in
   x86_64)        NVIM_ARCH="x86_64" ;;
   aarch64|arm64) NVIM_ARCH="arm64"  ;;
   *)             NVIM_ARCH="x86_64" ;;
 esac
-NVIM_VER=\$(curl -sL "https://api.github.com/repos/neovim/neovim/releases/latest" \
+NVIM_VER=$(curl -sL "https://api.github.com/repos/neovim/neovim/releases/latest" \
   | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-[ -z "\$NVIM_VER" ] && NVIM_VER="v0.10.4"  # fallback if API unreachable
-NVIM_URL="https://github.com/neovim/neovim/releases/download/\${NVIM_VER}/nvim-linux-\${NVIM_ARCH}.tar.gz"
-mkdir -p "\$NVIM_REMOTE_HOME"
-curl -sL "\$NVIM_URL" | tar -xzf - -C "\$NVIM_REMOTE_HOME" --strip-components=1
-echo "NVIM_OK \${NVIM_VER} linux-\${NVIM_ARCH}"
+[ -z "$NVIM_VER" ] && NVIM_VER="v0.10.4"
+mkdir -p "$NVIM_REMOTE_HOME"
+curl -sL "https://github.com/neovim/neovim/releases/download/${NVIM_VER}/nvim-linux-${NVIM_ARCH}.tar.gz" \
+  | tar -xzf - -C "$NVIM_REMOTE_HOME" --strip-components=1
+echo "NVIM_OK ${NVIM_VER} linux-${NVIM_ARCH}"
 REMOTENVIM
-)
-    ssh "$host" "bash -s" <<< "$nvim_setup_script" > /tmp/sssh_nvim_dl.log 2>&1 &
     nvim_dl_pid=$!
   fi
 
   # ── copy binaries in parallel ─────────────────────────────────────
   local pids=() copied=() labels=()
   echo ""
-  echo "📦 Copying binaries to $host..."
-
-  # copy shared libs first (if any bins need bundling)
-  if [ ${#all_dep_paths[@]} -gt 0 ]; then
-    ssh "$host" "mkdir -p /tmp/lib" 2>/dev/null
-    for dep in "${all_dep_paths[@]}"; do
-      scp -q "$dep" "$host:/tmp/lib/$(basename $dep)" 2>/dev/null &
-      pids+=($!); copied+=("/tmp/lib/$(basename $dep)"); labels+=("lib/$(basename $dep)")
-    done
-  fi
+  echo "📦 Copying to $host..."
 
   for i in "${!to_copy[@]}"; do
-    local bin="${to_copy[$i]}" deps="${to_bundle_deps[$i]:-}"
-
-    if [ -n "$deps" ] && [ "$deps" != "TOO_MANY" ]; then
-      # has bundled deps — copy as hidden .bin, wrapper goes on remote via ssh
-      scp -q "${to_copy_paths[$i]}" "$host:/tmp/.${bin}.bin" 2>/dev/null &
-      pids+=($!); copied+=("/tmp/.${bin}.bin"); labels+=("${bin} (binary)")
-    else
-      # static or too-many-deps — copy directly as /tmp/bin
-      scp -q "${to_copy_paths[$i]}" "$host:/tmp/${bin}" 2>/dev/null &
-      pids+=($!); copied+=("/tmp/${bin}"); labels+=("${bin}")
-    fi
+    scp -q "${to_copy_paths[$i]}" "$host:/tmp/${to_copy[$i]}" 2>/dev/null &
+    pids+=($!); copied+=("/tmp/${to_copy[$i]}"); labels+=("${to_copy[$i]}")
   done
 
-  # env file — track pid, rm only after wait (race condition fix)
   local env_pid
   scp -q "$tmp_env" "$host:/tmp/.sssh_env" 2>/dev/null &
   env_pid=$!
@@ -365,31 +345,102 @@ REMOTENVIM
   done
   rm -f "$tmp_env"
 
-  # ── create wrapper scripts on remote for bins with bundled deps ───
-  local wrappers_needed=false
-  for i in "${!to_copy[@]}"; do
-    local bin="${to_copy[$i]}" deps="${to_bundle_deps[$i]:-}"
-    [ -z "$deps" ] || [ "$deps" = "TOO_MANY" ] && continue
-    wrappers_needed=true
-  done
+  # ── verify binaries on remote — with musl fallback for broken ones ─
+  echo ""
+  echo "🔍 Verifying binaries on remote..."
 
-  if $wrappers_needed; then
-    echo ""
-    echo "🔧 Creating lib wrappers on remote..."
-    local wrapper_cmds=""
-    for i in "${!to_copy[@]}"; do
-      local bin="${to_copy[$i]}" deps="${to_bundle_deps[$i]:-}"
-      [ -z "$deps" ] || [ "$deps" = "TOO_MANY" ] && continue
-      # wrapper: sets LD_LIBRARY_PATH then execs the real hidden binary
-      wrapper_cmds+="
-        printf '#!/bin/sh\nexec env LD_LIBRARY_PATH=\"/tmp/lib:\${LD_LIBRARY_PATH}\" /tmp/.${bin}.bin \"\$@\"\n' > /tmp/${bin}
-        chmod +x /tmp/${bin}
-        echo 'WRAPPER_OK ${bin}'"
-    done
-    ssh "$host" "bash -c '$wrapper_cmds'" 2>/dev/null | while read -r line; do
-      bin="${line#* }"
-      [[ "$line" == WRAPPER_OK* ]] && echo "  ✓  $bin wrapper created"
-    done
+  # build one remote script that verifies + downloads musl fallback if broken
+  local verify_script='
+_sssh_get_latest_ver() {
+  curl -sL "https://api.github.com/repos/$1/releases/latest" \
+    | grep "\"tag_name\"" | head -1 | cut -d"\"" -f4 | tr -d "v"
+}
+_sssh_musl_download() {
+  local bin="$1" arch=$(uname -m)
+  case "$bin" in
+    bat)
+      local ver=$(_sssh_get_latest_ver "sharkdp/bat")
+      case "$arch" in
+        x86_64)  url="https://github.com/sharkdp/bat/releases/download/v${ver}/bat-v${ver}-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64) url="https://github.com/sharkdp/bat/releases/download/v${ver}/bat-v${ver}-aarch64-unknown-linux-musl.tar.gz" ;;
+      esac
+      curl -sL "$url" | tar -xzf - --wildcards --strip-components=1 -O "*/bat" > /tmp/bat
+      ;;
+    rg)
+      local ver=$(_sssh_get_latest_ver "BurntSushi/ripgrep")
+      case "$arch" in
+        x86_64)  url="https://github.com/BurntSushi/ripgrep/releases/download/${ver}/ripgrep-${ver}-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64) url="https://github.com/BurntSushi/ripgrep/releases/download/${ver}/ripgrep-${ver}-aarch64-unknown-linux-musl.tar.gz" ;;
+      esac
+      curl -sL "$url" | tar -xzf - --wildcards --strip-components=1 -O "*/rg" > /tmp/rg
+      ;;
+    fd)
+      local ver=$(_sssh_get_latest_ver "sharkdp/fd")
+      case "$arch" in
+        x86_64)  url="https://github.com/sharkdp/fd/releases/download/v${ver}/fd-v${ver}-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64) url="https://github.com/sharkdp/fd/releases/download/v${ver}/fd-v${ver}-aarch64-unknown-linux-musl.tar.gz" ;;
+      esac
+      curl -sL "$url" | tar -xzf - --wildcards --strip-components=1 -O "*/fd" > /tmp/fd
+      ;;
+    fzf)
+      local ver=$(_sssh_get_latest_ver "junegunn/fzf")
+      case "$arch" in
+        x86_64)  url="https://github.com/junegunn/fzf/releases/download/v${ver}/fzf-${ver}-linux_amd64.tar.gz" ;;
+        aarch64) url="https://github.com/junegunn/fzf/releases/download/v${ver}/fzf-${ver}-linux_arm64.tar.gz" ;;
+      esac
+      curl -sL "$url" | tar -xzf - -O "fzf" > /tmp/fzf
+      ;;
+  esac
+  chmod +x "/tmp/$bin" 2>/dev/null
+}
+'
+
+  for i in "${!to_copy[@]}"; do
+    local bin="${to_copy[$i]}"
+    verify_script+="
+      if /tmp/$bin --version >/dev/null 2>&1 || /tmp/$bin --help >/dev/null 2>&1; then
+        echo \"OK $bin\"
+      else
+        echo \"BROKEN $bin — trying musl fallback...\"
+        _sssh_musl_download $bin
+        if /tmp/$bin --version >/dev/null 2>&1; then
+          echo \"OK_MUSL $bin\"
+        else
+          echo \"FAILED $bin\"
+          rm -f /tmp/$bin
+        fi
+      fi"
+  done
+  verify_script+="
+unset -f _sssh_get_latest_ver _sssh_musl_download"
+
+  while IFS= read -r result; do
+    local bin="${result#* }"
+    case "$result" in
+      OK_MUSL*) echo "  ✓  $bin (musl fallback)" ;;
+      OK*)      echo "  ✓  $bin" ;;
+      BROKEN*)  echo "  ⚠  $result" ;;
+      FAILED*)  echo "  ✗  $bin (failed, removed)"
+                actual_copied=("${actual_copied[@]/\/tmp\/$bin}") ;;
+    esac
+  done < <(ssh "$host" "bash -c '$verify_script'" 2>/dev/null)
+
+  # ── DYNAMIC binary verification ───────────────────────────────────
+  local dyn_script=""
+  for i in "${!to_copy[@]}"; do
+    [[ "${to_copy_types[$i]}" != "DYNAMIC" ]] && continue
+    local bin="${to_copy[$i]}"
+    dyn_script+="
+      /tmp/$bin --version >/dev/null 2>&1 || /tmp/$bin -h >/dev/null 2>&1 \
+        && echo \"OK $bin\" || { echo \"BROKEN $bin\"; rm -f /tmp/$bin; }"
+  done
+  if [ -n "$dyn_script" ]; then
+    while IFS= read -r result; do
+      local bin="${result#* }"
+      [[ "$result" == OK* ]] \
+        && echo "  ✓  $bin (dynamic)" \
+        || { echo "  ✗  $bin (deps missing, removed)"; actual_copied=("${actual_copied[@]/\/tmp\/$bin}"); }
+    done < <(ssh "$host" "bash -c '$dyn_script'" 2>/dev/null)
   fi
 
   # ── sync nvim config + plugins ────────────────────────────────────
@@ -402,10 +453,10 @@ REMOTENVIM
       $nvim_remote_home/.local/state/nvim \
       $nvim_remote_home/.cache/nvim" 2>/dev/null
 
-    # inject mason-disable plugin BEFORE syncing so it lands on remote
+    # inject mason-disable plugin before syncing
     local mason_disable="$nvim_config_dir/lua/plugins/sssh_remote.lua"
     cat > "$mason_disable" << 'LUA'
--- auto-generated by sssh — disables mason/LSP on remote (no internet, wrong arch)
+-- auto-generated by sssh — disables mason/LSP on remote
 return {
   { "williamboman/mason.nvim",                   enabled = false },
   { "williamboman/mason-lspconfig.nvim",         enabled = false },
@@ -414,100 +465,59 @@ return {
 LUA
 
     _sssh_sync() {
-      local src="$1" remote_dst="$2" label="$3" extra_flags="${4:-}"
+      local src="$1" dst="$2" label="$3" flags="${4:-}"
       if command -v rsync &>/dev/null; then
         # shellcheck disable=SC2086
-        rsync -az $extra_flags --info=progress2 -e ssh \
-          "$src" "$host:$remote_dst" \
+        rsync -az $flags --info=progress2 -e ssh "$src" "$host:$dst" \
           && echo "  ✓  $label" || echo "  ✗  $label"
       else
-        echo "  (rsync not found — using tar)"
         tar -czf - -C "$(dirname "$src")" "$(basename "$src")" \
-          | ssh "$host" "mkdir -p $remote_dst && tar -xzf - -C $remote_dst" \
+          | ssh "$host" "mkdir -p $dst && tar -xzf - -C $dst" \
           && echo "  ✓  $label" || echo "  ✗  $label"
       fi
     }
 
-    # always sync config (includes sssh_remote.lua we just wrote)
-    _sssh_sync "$nvim_config_dir" \
-      "$nvim_remote_home/.config/" \
-      "nvim config"
+    _sssh_sync "$nvim_config_dir" "$nvim_remote_home/.config/" "nvim config"
 
-    # sync plugins
     if $copy_plugins && [ -d "$nvim_plugins_dir" ]; then
       echo "🔄 Syncing nvim plugins..."
       local so_flags=""
       $same_arch || so_flags="--exclude='*.so' --exclude='parser/' --exclude='build/'"
-      _sssh_sync "$nvim_plugins_dir" \
-        "$nvim_remote_home/.local/share/nvim/" \
-        "nvim plugins" \
-        "$so_flags"
+      _sssh_sync "$nvim_plugins_dir" "$nvim_remote_home/.local/share/nvim/" "nvim plugins" "$so_flags"
     fi
 
-    # remove local sssh_remote.lua — it only belongs on the remote
     rm -f "$mason_disable"
     unset -f _sssh_sync
 
-    # wait for nvim download + report
     echo ""
     echo "⬇  Waiting for nvim download..."
-    if wait "$nvim_dl_pid"; then
+    if wait "$nvim_dl_pid" 2>/dev/null; then
       local dl_result; dl_result=$(cat /tmp/sssh_nvim_dl.log 2>/dev/null)
-      if echo "$dl_result" | grep -q "NVIM_OK"; then
-        local ver; ver=$(echo "$dl_result" | grep "NVIM_OK" | awk '{print $2, $3}')
-        echo "  ✓  nvim $ver"
-      else
-        echo "  ✗  nvim download failed:"
-        cat /tmp/sssh_nvim_dl.log 2>/dev/null | sed 's/^/     /'
-      fi
+      echo "$dl_result" | grep -q "NVIM_OK" \
+        && echo "  ✓  nvim $(echo "$dl_result" | grep NVIM_OK | awk '{print $2, $3}')" \
+        || { echo "  ✗  nvim download failed:"; sed 's/^/     /' /tmp/sssh_nvim_dl.log; }
     else
       echo "  ✗  nvim download failed"
-      cat /tmp/sssh_nvim_dl.log 2>/dev/null | sed 's/^/     /'
+      sed 's/^/     /' /tmp/sssh_nvim_dl.log 2>/dev/null
     fi
     rm -f /tmp/sssh_nvim_dl.log
 
-    # recompile treesitter parsers if arch mismatch
     if $copy_plugins && ! $same_arch; then
-      echo "🔨 Recompiling treesitter parsers (arch mismatch, needs gcc on remote)..."
+      echo "🔨 Recompiling treesitter parsers (arch mismatch)..."
       ssh "$host" "
         XDG_CONFIG_HOME=$nvim_remote_home/.config \
         XDG_DATA_HOME=$nvim_remote_home/.local/share \
         XDG_STATE_HOME=$nvim_remote_home/.local/state \
         XDG_CACHE_HOME=$nvim_remote_home/.cache \
-          $nvim_remote_home/bin/nvim --headless \
-            -c 'TSUpdateSync' -c 'qa' 2>/dev/null
+          $nvim_remote_home/bin/nvim --headless -c 'TSUpdateSync' -c 'qa' 2>/dev/null
       " && echo "  ✓  parsers recompiled" \
-        || echo "  ⚠  parser recompile had errors (gcc may be missing — some languages may not highlight)"
+        || echo "  ⚠  recompile had errors (gcc may be missing)"
     fi
-  fi
-
-  # ── verify DYNAMIC binaries ───────────────────────────────────────
-  local verify_script=""
-  for i in "${!to_copy[@]}"; do
-    [[ "${to_copy_types[$i]}" != "DYNAMIC" ]] && continue
-    local bin="${to_copy[$i]}"
-    verify_script+="
-      if /tmp/$bin --version >/dev/null 2>&1 || /tmp/$bin -h >/dev/null 2>&1; then
-        echo \"OK $bin\"
-      else
-        echo \"BROKEN $bin\"; rm -f /tmp/$bin
-      fi"
-  done
-
-  if [ -n "$verify_script" ]; then
-    echo ""
-    echo "🔍 Verifying dynamic binaries..."
-    while IFS= read -r result; do
-      local bin="${result#* }"
-      [[ "$result" == OK*     ]] && echo "  ✓  $bin works" \
-                                 || echo "  ✗  $bin broken (deps missing, removed)"
-    done < <(ssh "$host" "bash -c '$verify_script'" 2>/dev/null)
   fi
 
   echo ""
   echo "✓ Connecting..."
 
-  # aliases need --rcfile to survive into the new shell process
   local connect_cmd
   if [[ "$remote_shell" == *bash ]]; then
     connect_cmd="exec $remote_shell --rcfile /tmp/.sssh_env"
