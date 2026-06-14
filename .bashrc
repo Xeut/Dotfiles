@@ -55,7 +55,7 @@ alias please='sudo $(history -p !!)'
 alias showmem='ps -eo pid,ppid,cmd,%mem --sort=-%mem | head -n 10'
 alias showcpu='ps -eo pid,ppid,cmd,%cpu --sort=-%cpu | head -n 10'
 alias psg='ps aux | grep -v grep | grep -i -E'
-alias port='lsof -i :'
+#alias port='lsof -i :'
 
 # Misc
 alias weather='curl -s wttr.in?0'
@@ -81,6 +81,16 @@ countthis() { find . -path "./.venv" -prune -o -type f -exec wc -lw {} +; }
 myip() {
   echo "Local IP: $(hostname -I | awk '{print $1}')"
   echo "Public IP: $(curl -s https://ifconfig.me)"
+}
+
+port() {
+  if [ -z "$1" ]; then
+    sudo ss -tulnp
+  else
+    sudo ss -tulnp | grep ":$1" || echo "Kein Prozess auf Port $1 gefunden"
+    echo ""
+    sudo lsof -i ":$1"
+  fi
 }
 
 sssh() {
